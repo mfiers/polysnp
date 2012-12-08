@@ -1,0 +1,139 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import argparse
+import itertools
+import logging as lg
+import subprocess as sp
+
+import vcf
+lg.basicConfig(level=lg.DEBUG)
+
+parser = argparse.ArgumentParser(description='Find & Print locations from a '+
+                                 'polysnp output file!')
+parser.add_argument('vcf', type=str, default='-', nargs='?',
+                    help='vcf file input (needs nucleotide frequencies '+
+                    'FORMAT:NF, - for stdin)')
+parser.add_argument('-o', dest='out', help='vcf output', default='-')
+parser.add_argument('-r', type=str, help="region to process",
+                    dest='region')
+parser.add_argument('-g', dest='geno',  default=True, action='store_true',
+                    help='output simple genotypes (default))')
+parser.add_argument('-m', dest='missing',  default='-',
+                    help='print this for a missing value (default: -)')
+parser.add_argument('-p', dest='pile', action='store_true',
+                    help='output idealized pileups (with depth --depth DEPTH)')
+parser.add_argument('-P', dest='pileplus', action='store_true',
+                    help='output idealized pileups plus extra information')
+parser.add_argument('-n', dest='nuccount', action='store_true',
+                    help='output nucleotide counts')
+parser.add_argument('-N', dest='nuctable', action='store_true',
+                    help='output table for postprocessing')
+parser.add_argument('-L', dest='nuctable2', action='store_true',
+                    help='alternative output table')
+parser.add_argument('-M', dest='nuctable3', action='store_true',
+                    help='yet another alternative output format')
+parser.add_argument('-a', dest='allfreq', action='store_true',
+                    help='output allele frequencies')
+
+parser.add_argument('--depth', dest='depth', type=int, default=20,
+                    help='pileup depth (for use with -p)')
+
+args = parser.parse_args()
+
+
+vcf = vcf.PSVCF(args.vcf, region=args.region)
+if args.out == '-':
+    F = sys.stdout
+else:
+    F = open(args.out, 'w')
+
+outtype = 'genotype'
+if args.pileplus:
+    outtype = 'logoplus%d' % args.depth
+elif args.pile:
+    outtype = 'logo%d' % args.depth
+
+elif args.nuctable:
+    outtype = 'nuctable'
+    head = ["chr", "pos", "ref", "lcov", "sample", "nt", "cnt"]
+    F.write("\t".join(head) + "\n")
+
+elif args.nuctable2:
+    outtype = 'nuctable2'
+    head = "chr pos ref lcov sample CA CC CG CT FA FC FG FT A1F A2F A3F A4F".split()
+    F.write("\t".join(head) + "\n")
+
+elif args.nuctable3:
+    outtype = 'nuctable3'
+    head = "chr pos ref lcov".split()
+    for l in vcf.simple_names():
+        for aaafff in 'AF1 AF2 AF3 AF4'.split():
+            head.append('%s_%s' % (l, aaafff))
+    F.write("\t".join(head) + "\n")
+
+elif args.nuccount:
+    outtype = 'nuccount'
+    head = ["chr", "pos", "ref", "cov"]
+    for l in vcf.simple_names():
+        for n in ['A', 'C', 'G', 'T']:
+            head.append("%s_%s" % (l, n))
+    F.write("\t".join(head) + "\n")
+elif args.allfreq:
+    outtype = 'allfreq'
+
+lg.debug('Outtype %s' % outtype)
+
+if outtype  == 'nuctable':
+    samples = vcf.simple_names()
+    for i, record in enumerate(vcf):
+        for j, sample in enumerate(samples):
+            for k, nuc in enumerate(['A', 'C', 'G', 'T']):
+                F.write("\t".join([
+                    record.seq, str(record.pos), record.ref, str(record.dp),
+                    sample, nuc, str(record.samples[j].nf[k])]))
+                F.write("\n")
+elif outtype  == 'nuctable2':
+    samples = vcf.simple_names()
+    for i, record in enumerate(vcf):
+        for j, sample in enumerate(samples):
+            sd = sum(record.samples[j].nf)
+            if sd > 0:
+                frqs = [float(x) / sd for x in record.samples[j].nf]
+                afs = reversed(sorted(frqs))
+            else:
+                frqs = afs = [0., 0., 0., 0.]
+            F.write("\t".join(
+                [record.seq, str(record.pos), record.ref, str(record.dp), sample] +
+                map(str, record.samples[j].nf) +
+                map(str, frqs) +
+                map(str, afs)
+            ))
+            F.write("\n")
+
+elif outtype  == 'nuctable3':
+    samples = vcf.simple_names()
+    for i, record in enumerate(vcf):
+        F.write("\t".join(
+            [record.seq, str(record.pos), record.ref, str(record.dp)]))
+
+        for j, sample in enumerate(samples):
+            sd = sum(record.samples[j].nf)
+            if sd > 0:
+                frqs = [float(x) / sd for x in record.samples[j].nf]
+                afs = reversed(sorted(frqs))
+            else:
+                frqs = afs = [0., 0., 0., 0.]
+
+            F.write("\t" + "\t".join(
+                map(str, afs)))
+
+        F.write("\n")
+
+else:
+    for i, record in enumerate(vcf):
+        F.write("%s\n" % record.nice_str(t=outtype))
+
+

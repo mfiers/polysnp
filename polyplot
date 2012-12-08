@@ -1,0 +1,178 @@
+#!/usr/bin/env Rscript
+
+prefix <- commandArgs(trailingOnly = T)
+prefix
+
+samplenamesfile <- paste(prefix, 'names.tsv', sep='.')
+allelefreqfile <- paste(prefix, 'allele.freq.tsv', sep='.')
+snpperseqfile <- paste(prefix, 'allele.freq.tsv', sep='.')
+depthfile <- paste(prefix, 'depth.tsv', sep='.')
+
+sample.names <- as.matrix(read.table(samplenamesfile))
+colors <- c(
+       'dark red', 'dark green', 'dark blue', 
+       'orange', 'red', 'green', 'yellow')
+
+#allele frequencies
+freqs <- read.table(allelefreqfile)
+for (i in 0:(length(sample.names)-1)) {
+
+  print(paste("plotting freq plot for", sample.names[i+1]))
+  j <- i*4
+  
+  fp1 <- as.matrix(freqs[j+1])
+  fp2 <- as.matrix(freqs[j+2])
+  fp3 <- as.matrix(freqs[j+3])
+  fp4 <- as.matrix(freqs[j+4])
+
+  fps1 <- sort(fp1)
+  fps2 <- sort(fp2)
+  fps3 <- sort(fp3)
+  fps4 <- sort(fp4)
+
+  fpa <- c(fp1, fp2, fp3, fp4)
+  
+  dp1 <- density(fp1)
+  dp2 <- density(fp2)
+  #dp3 <- density(fp3)
+  #dp4 <- density(fp4)
+  dpa <- density(fpa)
+  
+  lcb <- 0.15
+  ucb <- 0.85
+  
+  dpc1 <- density(fp1[fp1>lcb & fp1<ucb])
+  dpc2 <- density(fp2[fp2>lcb & fp2<ucb])
+  #dpc3 <- density(fp3[fp3>lcb & fp3<ucb])
+  #dpc4 <- density(fp4[fp4>lcb & fp4<ucb])
+  dpca <- density(fpa[fpa>lcb & fpa<ucb])
+
+
+  png(paste(prefix, 'allele.freq', sample.names[i+1], 'sorted.png', sep='.'),
+         width = 1200, height = 1200)
+
+  plot(fps1, col='black', log='y', type='l',
+       main=paste('allele frequency values for', sample.names[i+1]),
+       xlab='allele frequency',
+       ylab='density'
+       )
+  
+  lines(fps2,col='green')
+  lines(fps3,col='blue')
+  lines(fps4,col='red')
+  legend("top", legend = c('primary', 'secondary', 'tertiary', 'quaternary', 'all'),
+         col=c('black', 'green', 'blue', 'red', 'purple'), lwd=1, bty='n', ncol=5)
+  dev.off()
+
+  
+  png(paste(prefix, 'allele.freq', sample.names[i+1], 'density.png', sep='.'),
+         width = 1200, height = 1200)
+
+  plot(dp1, xlim=c(0,1), col='black', log='y',
+       main=paste('allele frequency density distribution for', sample.names[i+1]),
+       xlab='allele frequency',
+       ylab='density'
+       )
+  
+  lines(dp2,col='green')
+  #lines(dp3,col='blue')
+  #lines(dp4,col='red')
+  lines(dpa,col='purple')
+  legend("top", legend = c('primary', 'secondary', 'tertiary', 'quaternary', 'all'),
+         col=c('black', 'green', 'blue', 'red', 'purple'), lwd=1, bty='n', ncol=5)
+  dev.off()
+
+  breaks <- (0:50) / 50
+  hp1 <- hist(fp1, breaks=breaks, plot=FALSE)
+  hp2 <- hist(fp2, breaks=breaks, plot=FALSE)
+  #hp3 <- hist(fp3, breaks=breaks, plot=FALSE)
+  #hp4 <- hist(fp4, breaks=breaks, plot=FALSE)
+  hpa <- hist(fpa, breaks=breaks, plot=FALSE)
+
+  png(paste(prefix, 'allele.freq', sample.names[i+1], 'histogram.png', sep='.'),
+    width = 1200, height = 1200)
+  plot(hp1$mids, hp1$counts, xlim=c(0,1), col='black', log='y',
+       main=paste('allele frequency density distribution for', sample.names[i+1]),
+       xlab='allele frequency', type='l',
+       ylab='density'
+       )
+  lines(hp2$mids, hp2$counts, col='green')
+  #lines(hp3$mids, hp3$counts, col='blue')
+  #lines(hp4$mids, hp4$counts, col='red')
+  lines(hpa$mids, hpa$counts, col='purple')
+  legend("top", legend = c('primary', 'secondary', 'tertiary', 'quaternary', 'all'),
+         col=c('black', 'green', 'blue', 'red', 'purple'), lwd=1, bty='n', ncol=5)
+  dev.off()
+  
+  ## png(paste(prefix, 'allele.freq.2vs3', sample.names[i+1], 'png', sep='.'))
+  ## plot( as.matrix(freqs[j+2]), as.matrix(freqs[j+3]), col='black', pch=19, cex=0.1,
+
+  ##      main=paste('allele frequency density distribution for', sample.names[i+1]),
+  ##      xlab='allele frequency',
+  ##      ylab='density'
+  ##      )
+  ## dev.off()
+  
+}
+
+#plot depth distributions
+depths <- read.table(depthfile)
+
+names(depths) <- sample.names
+names(depths)
+
+processDepthCol <- function(col) {
+         col <- as.matrix(col)
+         return(col)
+}
+
+
+fdcol = processDepthCol(depths[sample.names[1]])
+min(fdcol)
+max(fdcol)
+
+png(paste(prefix, 'depth.density.png', sep='.'),
+    width = 1200, height = 1200)
+
+dp <- density(fdcol)
+plot(dp,
+     col = 'black',
+     main='depth density plot for all loci',
+     xlab='depth',
+     ylab='density',
+     )
+
+for (i in 2:ncol(sample.names))  {
+  print(i)
+  lines(
+        density(processDepthCol(depths[sample.names[i]])),
+        col=colors[i],
+        )
+}
+legend("topright", legend=sample.names, ncol=1, col=colors, lwd=1)
+dev.off()
+
+png(paste(prefix, 'depth.density.log.png', sep='.'),
+    width = 1200, height = 1200)
+dp <- density(fdcol)
+plot(dp, col = 'black',
+     log='y',
+     main='log depth density plot for all loci',
+     xlab='depth',
+     ylab='density',
+     )
+
+for (i in 2:ncol(sample.names))  {
+  print(i)
+  lines(
+        density(processDepthCol(depths[sample.names[i]])),
+        col=colors[i],
+        )
+}
+legend("topright", legend=sample.names, ncol=1, col=colors, lwd=1)
+dev.off()
+
+
+#freqs <- read.table(allelefreqfile)
+
+snpsperseq <- read.table(snpperseqfile,)

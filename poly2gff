@@ -1,0 +1,68 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import argparse
+import itertools
+import logging as lg
+import subprocess as sp
+
+import vcf
+
+lg.basicConfig(level=lg.DEBUG)
+
+parser = argparse.ArgumentParser(description='Convert a polysnp vcf file to BED')
+parser.add_argument('vcf', type=str, default='-', nargs='?', 
+                    help='vcf file input (needs nucleotide frequencies '+
+                    'FORMAT:NF, - for stdin)')
+parser.add_argument('-o', dest='out', help='vcf output', default='-')
+parser.add_argument('-r', type=str, help="region to process",
+                    dest='region')
+parser.add_argument('--sample_names', dest='samplenames',
+                    help='nice sample names, comma separated')
+
+args = parser.parse_args()
+
+vcf = vcf.PSVCF(args.vcf, region=args.region)
+
+if args.samplenames:
+    nicenames = args.samplenames.split(',')
+else:
+    nicenames = [x.split('/')[-1].replace('.bam') for x in
+                 vcf.sample_names]
+
+lg.info("sample names %s" % nicenames)
+if args.out == '-':
+    F = sys.stdout
+else:
+    F = open(args.out, 'w')
+   
+for i, record in enumerate(vcf):
+
+    for j, s in enumerate(vcf.sample_names):
+        nsn = nicenames[j]
+        an = ''.join(record.vars)
+        if not an: an = '-'
+        attrs = [
+            'ID=snp_%s_%s_%s_%s_%s' % (record.seq, nsn, record.pos, record.ref, an),
+            'Name=%s:%s/%s' % (nsn, record.ref, an),
+            'Sample=%s' % vcf.sample_names[j],
+            ]
+
+        F.write("\t".join(
+
+            map(str,
+                [ record.seq,
+                  'polysnp',
+                  'snp',              
+                  record.pos,
+                  record.pos + len(record.ref)-1,
+                  record.score,
+                  '+',
+                  '.',
+                  ';'.join(attrs)
+                  ]))+ "\n")
+
+    
+

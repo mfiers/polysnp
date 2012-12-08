@@ -1,0 +1,59 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import numpy
+import argparse
+import itertools
+import logging as lg
+import subprocess as sp
+
+import vcf
+lg.basicConfig(level=lg.DEBUG)
+
+parser = argparse.ArgumentParser(description='Calculate a distance matrix from a polysnp output!')
+
+parser.add_argument('vcf', default='-', nargs='?',
+                    help='vcf file input (needs nucleotide frequencies FORMAT:NF')
+
+parser.add_argument('-D', dest='dist', type=float, default=0.25,
+                    help='min distance difference for all alleles between ' +
+                    'any two samples below which a locus is said to have no ' +
+                    'variation, default 0.25')
+
+args = parser.parse_args()
+
+
+vcf = vcf.PSVCF(args.vcf)
+samples = vcf.simple_names()
+samples.append('ref')
+
+print vcf.sample_names
+lg.info("processing sampels %s" % samples)
+norecs = 0
+
+for i, rec in enumerate(vcf):
+    addarr = numpy.array(rec.dist_matrix(measure='euclidian'))
+    diffarr = numpy.asarray((addarr > args.dist), dtype=numpy.int)
+
+    norecs += 1
+    if i == 0:
+        sumdiff = diffarr
+        sumdist = addarr 
+    else:
+        sumdiff += diffarr
+        sumdist += addarr
+
+
+def print_nicely(samples, matrix, factor, strf):
+    print "%20s" % '',
+    print " | ".join(["%10s" % x for x in samples])
+    for j, rw in enumerate(matrix):
+        print "%20s" % samples[j],
+        print " - ".join([strf % (x/float(factor)) for x in rw])
+
+
+print_nicely(samples, sumdist, norecs, '%10.4f')
+print
+print_nicely(samples, sumdiff, 1, '%10d')

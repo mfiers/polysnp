@@ -1,0 +1,186 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import argparse
+import shlex
+import time
+import logging as lg
+import textwrap
+import subprocess as sp
+
+lg.basicConfig(level=lg.DEBUG)
+
+parser = argparse.ArgumentParser(description='View FreeBayes output!')
+
+parser.add_argument('vcf', help='Freebayes vcf output')
+
+parser.add_argument('-q', '--qual', help='qual cutof', type=float, default=20)
+parser.add_argument('-r', '--region', help='reiong to process')
+parser.add_argument('-n', '--no', help='no results to show, -1=all', type=int, default=-1)
+parser.add_argument('-p', '--depth', help='minimal depth per genotype', type=int)
+
+parser.add_argument('-d', '--diff', help='show loci that are different', action='store_true', default=False)
+parser.add_argument('-D', '--DIFF', help='show loci with at least one allele that is completely absent in the other strain', action='store_true', default=False)
+parser.add_argument('-R', dest='drama', help='show loci with a big difference of at least X alleles', metavar='X', type=int)
+
+parser.add_argument('-l', '--long', help='full output', action='store_true', default=False)
+
+args = parser.parse_args()
+if not args.region:
+    print "must specify region"
+    sys.exit(-1)
+
+lg.info("openingn %s" % args.vcf)
+
+libs = []
+
+cl = ['tabix', '-h', args.vcf, args.region]
+P = sp.Popen(cl, stdout=sp.PIPE)
+
+
+i = 0
+
+
+header_info={}
+
+def simpleoutput(r):
+    ls = r['ls']    
+    out = [ls[0], ls[1], ls[3], ls[4], ls[5]]
+    out.append(ls[8])
+    out.extend(r['gtypes'])
+    print "\t".join(out)
+
+def fulloutput(r):
+    print '-' * 120
+    print '###',
+    simpleoutput(r)
+    ls = r['ls']
+    inf = ls[7].split(';')
+    for i in inf:
+        if '=' in i:
+            k, v = i.split('=', 1)
+            desc = textwrap.wrap(
+                header_info.get(k, {}).get('Description', ''),
+                width=80)
+            print '# I %-8s : %-15s : %s' % (k[:8], v, desc[0])
+            for d in desc[1:]:
+                print "#" + " " * 32, d
+                
+        else:
+            desc = header_info.get(i, {}).get('Description', '')
+            print '# I %-8s   %-15s : %s' % (i, '', desc)
+    GTFIELDS = ls[8].split(':')
+    for i, ga in enumerate(ls[9:]):
+        print "### Genotype %d - %s" % ((i+1), libs[i])
+        for j, gf in enumerate(ga.split(':')):
+            desc = textwrap.wrap(
+                header_info.get(GTFIELDS[j], {}).get('Description', ''),
+                width=80)
+            print "# %-2d %-7s : %-15s : %s" % ((i+1), GTFIELDS[j], gf, desc[0])
+            for d in desc[1:]:
+                print "#" + " " * 32, d
+
+    
+
+def parseInfo(line):
+    lexer = shlex.shlex(line)
+    lexer.wordchars += '.'
+    lexer.quotes = '"'
+    tokens = [x for x in lexer if not x in ['=', ',']]
+    info = {}
+    while tokens:
+        key = tokens.pop(0)
+        val = tokens.pop(0)
+        info[key] = val
+    return info
+
+def addinfo(line):
+    line = line.replace('##INFO=<', '').strip()[:-1]
+    info = parseInfo(line)
+    header_info[info['ID']] = info
+
+def addformat(line):
+    line = line.replace('##FORMAT=<', '').strip()[:-1]
+    info = parseInfo(line)
+    header_info[info['ID']] = info
+
+for line in P.stdout:
+    line = line.strip()
+    if not line: 
+        continue
+
+    if line[:6] == '#CHROM':
+        ls = line.split("\t")
+        libs = ls[9:]        
+        lg.info('libs %s' % libs)
+
+    if line[:1] == '#':
+        if '##INFO=' in line:
+            addinfo(line)
+        if '##FORMAT=' in line:
+            addformat(line)
+        continue
+    
+    ls = line.split("\t")
+    r = {}
+
+    r['libs'] = libs
+    r['line'] = line
+    r['ls'] = ls
+
+    if float(ls[5]) < args.qual: 
+        continue
+
+    def get_gtype(x):
+        x = x.split(':')
+        return "".join(x[0].split('/'))
+
+    gtypes = [get_gtype(x) for x in ls[9:]]
+    r['gtypes'] = gtypes
+
+    if '.' in gtypes:
+        #not all genotypes are called - ignore for the time being
+        continue
+
+    if args.depth:
+        depth_ok = True
+        gf = ls[8].split(':').index('DP')
+        for gt in ls[9:]:
+            gtd = gt.split(':')[gf]
+            if int(gtd) <  args.depth:
+                depth_ok = False
+        if not depth_ok: 
+            continue
+
+    if args.drama:
+        maxhamm = 0
+        for i, a in enumerate(gtypes):
+            for j, b in enumerate(gtypes):
+                if i >= j: 
+                    continue
+                hamm = 0                
+                for c, d in zip(a, b):
+                    if c != d:
+                        hamm += 1                    
+                #print i, j, a, b, hamm
+                maxhamm = max(maxhamm, hamm)
+        if maxhamm < args.drama:
+            continue
+    elif args.DIFF:
+        gset = set(["".join(sorted(set(list(x)))) for x in gtypes])
+        if len(gset) < 2: 
+            continue
+    elif args.diff:
+        gset = set(gtypes)
+        if len(gset) == 1:
+            continue
+    i += 1
+    if args.long:
+        fulloutput(r)
+    else:
+        simpleoutput(r)
+
+    if args.no != -1 and i >= args.no:
+        break

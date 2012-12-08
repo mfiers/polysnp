@@ -1,0 +1,151 @@
+#!/usr/bin/env python
+# Select records in a VCF file -
+#
+# currently selects only on a minimal read depth for each sample
+
+import os
+import re
+import sys
+import argparse
+import itertools
+import logging as lg
+import subprocess as sp
+
+import vcf
+lg.basicConfig(level=lg.DEBUG)
+
+parser = argparse.ArgumentParser(
+    description='Find & Print locations from a polysnp output file!')
+
+parser.add_argument('-d', type=int, dest='depth',
+                    help='required depth (for each! sample) to output '+
+                    'this locus', default=0)
+
+parser.add_argument('-a', type=int, dest='minacount',
+                    help='minimal allele count per locus - any allele with a'+
+                    ' count less than this gets reset to zero', default=-1)
+
+parser.add_argument('-f', dest='minafrac', type=float,
+                    help='minimal allele fraction per locus - any allele with a'+
+                    ' fraction less than this gets reset to zero', default=-1)
+
+parser.add_argument('-n', type=int, dest='no', default=0,
+                    help='no records to output (default: all)')
+parser.add_argument('-m', dest='measure', default='absolute',
+                    help='measure to determine if there is variation ' +
+                    '(absolute/allelefreq)')
+
+parser.add_argument('-D', dest='dist', type=float, default=0.25,
+                    help='min distance difference for all alleles between ' +
+                    'any two samples below which a locus is said to have no ' +
+                    'variation, default 0.25')
+
+parser.add_argument('--ax', type=int, dest='maxalleles', default=4,
+                    help='select only records where each sample has at most ' +
+                    'this number of differnt alleles (default: 4)')
+parser.add_argument('--an', type=int, dest='minalleles', default=0,
+                    help='select only records where each sample has at least ' +
+                    'this number of different alleles (default: 0)')
+parser.add_argument('-v', dest='musthavevariation', default=False,
+                    help='select only records that have variation inbetween ' +
+                    'the samples', action='store_true')
+
+parser.add_argument('-o', dest='out', help='vcf output', default='-')
+parser.add_argument('vcf', type=str, help='vcf file input (needs nucleotide '+
+                    ' frequencies FORMAT:NF) (- for stdin)')
+
+args = parser.parse_args()
+
+vcf = vcf.PSVCF(args.vcf)
+if args.out == '-':
+    F = sys.stdout
+else:
+    F = open(args.out, 'w')
+
+vcf.add_meta('polyselect', ' '.join(sys.argv))
+F.write(vcf.build_header())
+selected = 0
+loci_removed = 0
+
+allsamples = vcf.simple_names()
+allsamples.append('ref')
+
+for i, locus in enumerate(vcf):
+
+    if args.musthavevariation:
+        if args.measure == 'allelefreq':
+            if locus.has_sample_variation(measure='absolute', maxval=0.1):
+                #show this allele!
+                pass
+            elif locus.has_sample_variation(measure='allelefreq', maxval=args.dist):
+                pass
+            else:
+                loci_removed +=1
+                continue
+                
+        elif args.measure == 'absolute':
+            if locus.has_sample_variation(measure='absolute', maxval=0.1):
+                loci_removed += 1
+                continue
+            
+    
+    if args.minacount != -1:
+
+        def _correct_acount(a):
+            if a < args.minacount: return 0
+            return a
+
+        for sample in locus.samples:
+            sample.nf = [_correct_acount(x) for x in sample.nf]
+
+        #check if this is still a variant locus!
+        if locus.simple():
+            loci_removed += 1
+            continue
+            
+    if args.minafrac != -1:
+        def _correct_afrac(a, dp):
+            if dp == 0: return 0
+            if float(a)/dp < args.minafrac: return 0
+            return a
+
+        for sample in locus.samples:
+            sample.nf = [_correct_afrac(x, sample.dp) for x in sample.nf]
+
+        #check if this is still a variant locus!
+        if locus.simple():
+            loci_removed += 1
+            continue
+
+    #select
+    if locus.min_depth() < args.depth:
+        loci_removed += 1
+        continue
+
+    
+    if args.maxalleles < 4:
+        if locus.max_no_alleles() > args.maxalleles:
+            loci_removed += 1
+            continue
+        
+    if args.minalleles > 0:
+        if locus.min_no_alleles() < args.minalleles:
+            loci_removed += 1
+            continue
+
+    #print 'pass4'
+    #if args.musthavevariation:
+    #    if not locus.has_variation():
+    #        continue
+    
+
+
+    #found one!
+    selected += 1
+    if args.no and selected > args.no: break
+
+    #output
+    F.write("%s\n" % locus.build_vcf_line())
+
+lg.critical("%d loci were removed" % loci_removed)
+lg.critical("%d loci were send to output" % (selected-1))

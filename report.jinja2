@@ -1,0 +1,39 @@
+Polysnp/polystat report
+
+No loci seen        : {{ "%6d"|format(total_loci_seen) }}
+No sequences        : {{ "%6d"|format(seqinfo|length) }}
+Sequences with loci : {{ "%6d"|format(seqs_with_snps) }}
+
+Number of alleles per locus
+
+                |       0 |       1 |       2 |       3 |       4 |     sum |
+----------------+---------+---------+---------+---------+---------+---------+
+{% for sample_name in output_names -%}
+{{ "%15s"|format(sample_name[:15]) }} |
+{%- for noall in range(0,5) -%}
+{{ "%8d"|format(alleles_per_locus[sample_name][noall]) }} |
+{%- endfor -%}
+{{ "%8d"|format(total_loci_seen) }} |
+{% endfor -%}
+----------------+---------+---------+---------+---------+---------+---------+
+ sum            |
+{%- for noall in range(0,5) -%}
+{{ "%8d"|format(sum_per_noall[noall]) }} |
+{%- endfor %}
+
+Percentage of alleles per locus
+
+                |       0 |       1 |       2 |       3 |       4 |     sum |
+----------------+---------+---------+---------+---------+---------+---------+
+{% for sample_name in output_names -%}
+{{ "%15s"|format(sample_name[:15]) }} |
+{%- for noall in range(0,5) -%}
+{{ "%7.2f%%"|format(perc_per_locus[sample_name][noall]) }} |
+{%- endfor -%}
+{{ "%7.2f%%"|format(100) }} |
+{% endfor -%}
+----------------+---------+---------+---------+---------+---------+---------+
+ sum            |
+{%- for noall in range(0,5) -%}
+{{ "%7.2f%%"|format(perc_per_noall[noall]) }} |
+{%- endfor %}

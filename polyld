@@ -1,0 +1,767 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import math
+import copy
+import argparse
+import itertools
+import collections
+import logging as lg
+import subprocess as sp
+
+from peekorator import Peekorator
+
+import numpy as np
+
+import networkx as nx
+
+import pysam
+
+import vcf
+
+LDLIST = []
+
+lg.basicConfig(level=lg.INFO)
+parser = argparse.ArgumentParser(description='Remove bad calls based on correlation ' +
+                                 'with a neighbouring SNPs')
+
+parser.add_argument('vcf', type=str, default='-', nargs='?',
+                    help='vcf file input (determines locations to check, '+
+                    '- for stdin)')
+
+parser.add_argument('-v',  help="Verbose output", dest='verbose',
+                    action='store_true', default=False)
+
+parser.add_argument('bam', nargs='+', help='samtools indexed bamfiles to check')
+parser.add_argument('-b', dest='base', help='basename for output', default='polyfix')
+parser.add_argument('-f', dest='fasta', help='fasta with the reference sequence, '+
+                    'needed for haplytype fasta output')
+parser.add_argument('-m', dest='min_allele_count', help='minimal allele count - discard otherwise',
+                    type=int, default=2)
+parser.add_argument('-S', dest='stepper', help='stepper to use for pileups ("all" or "samtools")',
+                    default='samtools')
+parser.add_argument('-r', type=str, help="region to process",
+                    dest='region')
+
+max_hap_gap_help="""
+Max gap allowed in a haplotype (default=2). A gap being a number of
+consecutive loci (as defined in the VCF) that could not be resolved to
+belong to that haplotype
+"""
+
+parser.add_argument('--max-haplotype-gap', type=int, default=2, help=max_hap_gap_help)
+
+max_gap_fraction="""
+Max fraction of gap loci allowed in a haplotype (default=0.25). The
+gap fraction being the fracion of loci (as defined in the VCF) that
+could not be resolved to belong to that haplotype
+"""
+parser.add_argument('--max_gap_fraction', type=int, default=4, help=max_gap_fraction)
+
+min_loci_hap_help="""
+minimal number of (resolved) loci in a haplotype (default=3)
+"""
+parser.add_argument('--min-haplotype-size', type=int, default=3, help=min_loci_hap_help)
+
+
+def PileupGenerator(vcf, bamfiles, region=None):
+    """
+    Return a set of stacked colums from the pileup - one for each sample.
+    """
+
+    plg = lg.getLogger('PiG')
+    plg.setLevel(lg.DEBUG)
+    pileups = []
+    plg.debug("opening pileupgenerator with region %s" % region)
+    for i, bamfile in enumerate(bamfiles):
+        if region:
+            pup = Peekorator(bamfile.pileup(region=region, stepper=args.stepper))
+            pileups.append(pup)
+            plg.debug("opened pileupgenerator with region %s (%s)" % (region, str(pup)))
+        else:
+            pup(Peekorator(bamfile.pileup(stepper=args.stepper)))
+            pileups.append(pup)
+            plg.info("opened global pileup generator (%s)" % (str(pup)))
+
+    current_ptid = 0
+
+    for record in vcf:
+        rv = [record]
+        #lg.debug("pileup finding record %s" % record)
+        for i, pileup in enumerate(pileups):
+            sid = nice_sample_names[i]
+
+            #see if we're in range for this pileup?
+            if pileup.empty:
+                #nothing in here -
+                rv.append(None)
+                continue
+
+            #peek at next record
+            peek = pileup.peek
+            try:
+                peekseq = bamfiles[i].getrname(peek.tid)
+            except:
+                lg.critical("cannot getrname from %s" % peek)
+                raise
+
+            assert(peekseq == record.seq) #no seq switching (yet)
+
+            if peek.pos >= record.pos:
+                #lg.info('next %d %d' % (peek.pos, record.pos))
+                #next pileup position is past the current record position:
+                rv.append(None)
+                continue
+
+            #ok - we're good - parse through the seqs until we have something
+            for p in pileup:
+                pseq = bamfiles[i].getrname(p.tid)
+
+                #we cannot switch sequences (yet)
+                assert(pseq == record.seq)
+
+                if pseq == record.seq and \
+                        p.pos+1 == record.pos:
+                    rv.append(p)
+                    break
+                if pileup.empty:
+                    rv.append(None)
+                    break
+                peek = pileup.peek
+                peekseq = bamfiles[i].getrname(peek.tid)
+                if peekseq == record.seq and peek.pos+1 > record.pos:
+                    #next position is passed our record
+                    rv.append(None)
+                    break
+            else:
+                #it appears we ran out of the pileup -
+                rv.append(None)
+            #nextcol = pileup.next()
+            #print nextcol
+        #lg.debug('yielding %d %s' % (record.pos, str(rv[-1])[:20]))
+        #if record.pos == 1880:
+        #    for j, r in enumerate(rv[1:]):
+        #        print nice_sample_names[j], r
+        yield(rv)
+
+def nid(c,p,n):
+    """
+    return node id
+    """
+    return '%s.%s.%s' % (c,p,n)
+
+def eid(a,b):
+    """
+    edge id
+    """
+    return ('%s.%s.%s' % a,
+            '%s.%s.%s' % b)
+
+def simple_report(message, g):
+    lg.info(message + ": %d nodes" %  len(g.nodes()))
+    loci = set([n[:2] for n in g.nodes()])
+    lg.info(message + ": %d loci" % len(loci))
+
+def createGraph(alg, rta, sampleid=None):
+    """
+    Create graph (alg) edges based on the reads_to_alleles (rta) structure
+    """
+
+    no_edges = 0
+    max_weight = 0
+    loci = collections.defaultdict(set)
+    linked_loci = set()
+
+    for read in rta:
+        for all1 in rta[read]:
+            loc1 = (all1[0], all1[1])
+            loci[loc1].add(all1)
+
+            #if not alg.has_node(all1): continue
+            for all2 in rta[read]:
+                loc2 = (all2[0], all2[1])
+                if loc1 == loc2: continue
+                loci[loc2].add(all2)
+
+                if all1 >= all2: continue
+
+                lnk = tuple(sorted([loc1, loc2]))
+                linked_loci.add(lnk)
+
+                if not alg.has_edge(all1, all2):
+                    no_edges += 1
+                    alg.add_edge(all1, all2, weight=0)
+
+                alg[all1][all2]['weight'] += 1
+                if alg[all1][all2]['weight'] > max_weight:
+                    max_weight = alg[all1][all2]['weight']
+    lg.info("Edges added: %d" % no_edges)
+    lg.info("Max weight: %d" % max_weight)
+    lg.info("unique loci %d" % len(loci))
+
+    return alg
+
+def getLoci(alg):
+    """
+    return a list of loci
+    """
+    loci = collections.defaultdict(set)
+    for node in alg.nodes():
+        loci[node[:2]].add(node)
+    return loci
+
+def LD(all1, all2, a1, b1, tbl):
+    """
+    calculate LD
+
+    :arg a1: Nucleotide of allele 1
+    :arg b1: Nucleotide of allele 2
+    :arg tbl: combination frequencies
+
+    function expects a table with the observed number of times
+    a combination occurs
+       tbl = {
+           (A, C) : 3,
+           (T, C) : 2,
+           (A, G) : 1,
+           (T, G) : 2 }
+
+    and then returns the LD between a1 and b1. For example, a1='A' and
+    b1='C'
+    """
+
+    LOG = True
+
+    # convert matrix to:
+    #             A1    A2 (!= A1)
+    #
+    # B1         x11   x21
+    # B2 (!=B1)  x12   x22
+    #
+
+    x11,x12,x21,x22 = 0,0,0,0
+
+    n = 0.
+    for k,v in loclin.items():
+        n += v
+        if k[0] == a1:
+            if k[1] == b1: x11 += v
+            else: x12 += v
+        else:
+            if k[1] == b1: x21 += v
+            else: x22 += v
+
+    #normalize
+    x11, x12, x21, x22 = x11/n, x12/n, x21/n, x22/n
+
+    #back to allele freqs
+    p1 = x11 + x12
+    p2 = x21 + x22
+    q1 = x11 + x21
+    q2 = x12 + x22
+
+    D = (x11 - (p1 * q1))
+
+    pp = p1 * q1 * p2 * q2
+    if pp == 0:
+        #cannot calculate LD - no evidence for any
+        return 0
+
+    DD = D / math.sqrt(p1 * p2 * q1 * q2 )
+    DD *= (1-(1./n)) # penalize for low coverage regions
+    LDLIST.append(DD)
+
+    if False:
+        if abs(DD) > 0.75:
+            mark = '@@'
+        else:
+            mark = '  '
+        print "%s  %s %s (%.2f/%.2f)--- %.2f %.2f %.2f %.2f ---  %6.4f %6.4f" % (
+            mark, a1, b1, x11, (p1 * q1), p1, p2, q1, q2, p1 * q1, DD)
+
+    return DD
+
+
+if __name__ == '__main__':
+
+    lg.info("starting polyld")
+    args = parser.parse_args()
+    if args.verbose:
+        lg.getLogger().setLevel(lg.DEBUG)
+
+    lg.debug("verbose output")
+
+    if args.region:
+        lg.info("processing region %s" % args.region)
+
+    vcf = vcf.PSVCF(args.vcf, region=args.region)
+
+    nice_sample_names = vcf.simple_names()
+    lg.info("vcf sample names: %s" % ", ".join(nice_sample_names))
+
+    bamfiles = []
+    lg.debug('opening bam files')
+    for i, bamfile in enumerate(args.bam):
+        if not nice_sample_names[i] in bamfile:
+            lg.warning("are you sure the order of bamfiles corresponds to the " +
+                       "order in the VCF file?")
+        lg.debug('opening bam %s' % bamfile)
+        bamfiles.append(pysam.Samfile(bamfile, 'rb'))
+
+
+
+    reads_to_alleles = [collections.defaultdict(list) for x in nice_sample_names]
+
+    #print reads_to_alleles
+    #allele connection graphs:
+    algs = [nx.Graph() for x in nice_sample_names]
+
+    #go through the reads. identify alleles, store what alleles are
+    #linked by what reads
+    loci_assessed = 0
+    alleles_assessed = 0
+    alleles_stored = 0
+    read_alleles_processed = 0
+
+    #create a big data structure with alleles linked to reads
+    for data in PileupGenerator(vcf, bamfiles, args.region):
+        record = data[0]
+        pileups = data[1:]
+        loci_assessed += 1
+
+        assert(len(pileups) == len(bamfiles))
+        for i, pileup in enumerate(pileups):
+
+            sample = record.samples[i]
+            alleles_assessed += 1
+
+            sample_alleles = sample.alleles()
+
+            if len(sample_alleles) < 2:
+                #this locus/sample does not need to be processed
+                continue
+
+            for a in sample.alleles():
+                #lg.debug("adding %s / %s / %s to graph" % (a, nice_sample_names[i], record))
+                algs[i].add_node((record.seq, record.pos, a), count=0)
+
+            if pileup == None: continue
+            alleles_stored += 1
+
+
+            # print nice_sample_names[i],  sample
+            for read in pileup.pileups:
+                nt = read.alignment.seq[read.qpos-1]
+                # print read.alignment.qname, nt, read.alignment.is_read1
+                read_alleles_processed += 1
+                try:
+                    algs[i].node[(record.seq, record.pos, nt)]['count'] += 1
+                except KeyError:
+                    #was not in the set - or so it appears - add it now
+                    algs[i].add_node((record.seq, record.pos, nt), count=0)
+
+                reads_to_alleles[i][read.alignment.qname].append(
+                    (record.seq, record.pos, nt))
+
+    lg.info("No loci assessed: %d" % loci_assessed)
+    lg.info("No loci*samples assessed: %d" % alleles_assessed)
+    lg.info("No loci*samples stored in graph: %d" % alleles_stored)
+    lg.info("No loci*samples*reads processed: %s" % read_alleles_processed)
+
+    #convert the reads-to-alleles structure to a graph linking alleles
+    lg.info("samples were %s" % nice_sample_names)
+
+    for i,g in enumerate(algs):
+
+        LDLIST = []
+
+        lg.info("Preparing graph for %s" % nice_sample_names[i])
+        rta = reads_to_alleles[i]
+        #print i, len(reads_to_alleles[i])
+        G = createGraph(g, rta)
+
+        #alg = filterGraph(alg)
+        #alg = filterGraph(alg)
+
+        loci = getLoci(G)
+
+        # now do the phi calculate per locus - with as aim to remove
+        # all links which are not strong
+        to_remove = set()
+        for l in  loci:
+            #print "LOCUS", l, len(loci[l])
+
+            #find all neighbouring loci
+            nloci = set()
+            for allele in loci[l]:
+                for neighbour in G.neighbors(allele):
+                    #only look of neighb. loci to the right of the current locus
+                    if neighbour <= allele: continue
+                    #remember this as a neighbour
+                    nloci.add(neighbour[:2])
+
+
+            # Now - for each pair
+            for nl in nloci:
+                #print " - NLOCUS", nl
+
+                # create a correlation table
+                loclin = collections.defaultdict(int)
+                # for all alleles for the current locus (l)
+                # and the neighbouring locus (nl)
+                for all1 in loci[l]:
+                    for all2 in loci[nl]:
+                        w = G[all1].get(all2, {}).get('weight', 0)
+                        loclin[(all1[2], all2[2])] += G[all1].get(all2, {}).get('weight', 0)
+
+                #now check if we want to keep this link
+                for all1 in loci[l]:
+                    for all2 in loci[nl]:
+                        if loclin.has_key((all1[2], all2[2])):
+                            ld = LD(all1, all2, all1[2], all2[2], loclin)
+                            if not G[all1].has_key(all2):
+                                G.add_edge(all1, all2, weight=0)
+                            if G[all1][all2].has_key('LD'):
+                                if G[all1][all2]['LD'] != ld:
+                                    print 'LD PROBLEM'
+                                    print all1, all2, G[all1][all2]['LD'], ld
+                            else:
+                                G[all1][all2]['LD'] = ld
+
+
+        lg.info("start postprocessing")
+        if args.base:
+            filebase = args.base
+        else:
+            filebase = ""
+        filebase += ".%s" % nice_sample_names[i]
+
+        with open(filebase + '.ld.table', 'w') as F:
+            F.write("chr\tpos\tnt\tapos\tant\tld\n")
+            for allele in G.nodes():
+                #print allele
+                for nall in G.neighbors(allele):
+
+                    F.write("%s\t%s\t%s\t%s\t%s\t%s\n" % (allele[0], allele[1], allele[2],
+                                                  nall[1], nall[2], G[allele][nall]['LD']))
+
+        # calculate matrici
+        def allele_nicename(a):
+            return "%s.%s.%s" % (a[0], a[1], a[2])
+
+        # calculate matrici
+        def nicename_allele(a):
+            l = a.rsplit('.', 2)
+            return l[0], int(l[1]), l[2]
+
+        with open(filebase + '.ld.matrix', 'w') as F:
+            for ab in G.nodes():
+                nb = allele_nicename(ab)
+                F.write("\t%s" % nb)
+            F.write("\n")
+
+            for aa in G.nodes():
+                na = allele_nicename(aa)
+                F.write("%s" % na)
+                for ab in G.nodes():
+                    nb = allele_nicename(ab)
+                    if G.has_edge(aa, ab):
+                        F.write("\t%s" % G[aa][ab]['LD'])
+                    else:
+                        F.write("\t0")
+                F.write("\n")
+
+        #run the R cluster algorithm
+        cl = 'polyldcluster %s.ld.matrix >/dev/null 2>/dev/null' % filebase
+        P = sp.Popen(cl, shell=True)
+        P.communicate()
+
+        #read the groups file
+        singles = []
+        groups = {}
+        rawgroups = collections.defaultdict(list)
+        with open('%s.ld.matrix.groups' % filebase) as F:
+            F.readline()
+            for line in F:
+                ls = line.split()
+                rawgroups[int(ls[1])].append(ls[0])
+
+        for g in rawgroups:
+            if len(rawgroups[g]) < 2:
+                singles.extend(map(nicename_allele, rawgroups[g]))
+            else:
+                groups[g] = map(nicename_allele, rawgroups[g])
+
+        def biggest_group(_group):
+            return sorted([(len(_group[g]), _group[g]) for g in _group])[-1][1]
+
+        def check_consistency(_group):
+            loci = []
+            negld = 0
+            multiloc = 0
+            for a in _group:
+                aloc = (a[0], a[1])
+                if aloc in loci:
+                    lg.warning("multilocus group %s" % str(aloc))
+                    multiloc += 1
+                loci.append(aloc)
+
+                for b in _group:
+                    if G.has_edge(a,b):
+                        ld = G[a][b]['LD']
+                    else:
+                        ld = 0
+                    if ld < 0:
+                        negld += ld
+                    if ld < -0.5:
+                        lg.warning("LD GROUP PROBLEM %s %s %s" (a,b,ld))
+
+            return {'negld' : negld,
+                    'multiloc' : multiloc}
+
+        def extend_group(_group):
+            lg.info("attempt extension of group %s len %d" % (
+                    _group[0][0], len(_group)))
+
+            seq = _group[0][0]
+            start, stop = _group[0][1], _group[0][1]
+            loci = collections.defaultdict(set)
+            for g in _group:
+                loci[g[:2]].add(g)
+                assert(seq == g[0])
+                start = min(start, g[1])
+                stop = max(stop, g[1])
+
+            lg.info("group start/stop %d %d (%d) " % (start, stop, stop-start))
+
+            # attempt to incorporate non conflicint loci within a group
+            #
+            aloci = getLoci(G)
+            add_to_group = []
+
+            for l in sorted(aloci):
+                in_group = False
+                #print l,
+                if l[1] >= start and l[1] <= stop:
+                    in_group = True
+
+                if l in loci:
+                    assert(len(loci[l]) == 1)
+                    continue
+
+
+                Candidate = collections.namedtuple('Candidate', ['posld', 'negld', 'allele'])
+                best_candidate = Candidate(0,0, (l[0], l[1], '?'))
+                for a in aloci[l]:
+                    negld = 0
+                    posld = 0
+                    for g in _group:
+                        if G.has_edge(a, g):
+                            ld = G[a][g]['LD']
+                        else:
+                            ld = 0
+                        if ld < 0: negld += ld
+                        else: posld += ld
+
+                    candidate = Candidate(posld, negld, a)
+                    if (not in_group and posld + negld > 4 and negld > -1) or \
+                            (in_group and posld + negld > 2 and negld > -0.5):
+                        #this is a viable candidate
+                        if not best_candidate:
+                            best_candidate = candidate
+                        else:
+                            if best_candidate.posld <  candidate.posld:
+                                best_candidate = candidate
+
+                    #print "| %s %5.2f %5.2f" % (a[2], negld, posld),
+
+                add_to_group.append(best_candidate.allele)
+
+
+            result = sorted(_group + add_to_group)
+
+            #do some cleaning
+            while result[0][2] == '?':
+                result.pop(0)
+
+            while result[-1][2] == '?':
+                result.pop()
+
+            haplostring = ''.join(r[2] for r in result)
+            lg.info("haplostring %s" % haplostring)
+
+            if '?' * args.max_haplotype_gap in haplostring:
+                lg.info("rejecting haplotype (gap) %s" % haplostring)
+                return None, haplostring
+
+            if float(haplostring.count('?')) / float(len(haplostring)) > args.max_gap_fraction:
+                lg.info("rejecting haplotype (frac?) %s" % haplostring)
+                return None, haplostring
+
+            if len(haplostring) - haplostring.count('?') < args.min_haplotype_size:
+                lg.info("rejecting haplotype (len) %s" % haplostring)
+                return None, haplostring
+
+
+            return result, haplostring
+
+        haplocount = 0
+        haplotypes = {}
+        haplostart = {}
+        hstrings = {}
+        haploloc = collections.defaultdict(dict)
+
+        with open(filebase + '.haplotypes', 'w') as F:
+            F.write("#haplotype_group\tseq\tpos\tnt\n")
+
+
+            for g in groups:
+
+                check_consistency(groups[g])
+                haplotype, haplostring = extend_group(groups[g])
+
+                if haplotype == None: continue
+
+                haplocount += 1
+                hstrings[haplocount] = haplostring
+                haplotypes[haplocount] = haplotype
+                haplostart[haplocount] = min([x[1] for x in haplotype])
+                print 'haplotype'
+                for a in haplotype:
+                    haploloc[haplocount][(a[0], a[1])] = a[2]
+                    F.write("%d\t%s\t%s\t%s\n" % (
+                            haplocount, a[0], a[1], a[2]))
+
+
+        haplo_start_keys  = [x[1] for x in sorted([(haplostart[x], x) for x in haplostart])]
+
+        loci = sorted(getLoci(G))
+
+        with open(filebase + '.haplostack', 'w') as F:
+            F.write("%-30s %10s : " % ('#sequence', 'position'))
+            for h in haplo_start_keys:
+                F.write(" %2s" % h)
+            F.write("\n")
+            for l in sorted(getLoci(G)):
+                F.write("%-30s %10d : " % (l[0], l[1]))
+                #F.write("%-30s %10d : " % ('#sequence', 'position')
+
+                for h in haplo_start_keys:
+                    a = haploloc[h].get(l, ' ')
+                    F.write(" %2s" % a)
+                F.write("\n")
+
+        if not args.fasta:
+            sys.exit()
+
+        sqcl = 'samtools faidx %s %s' % (args.fasta, args.region)
+        getseq = sp.Popen(sqcl, shell=True, stdout=sp.PIPE)
+        rawseq, getSeqError = getseq.communicate()
+
+        rstart, rstop = map(int, args.region.split(':')[1].split('-'))
+        lg.info("sequence: %s" % args.fasta)
+        lg.info("region: %s" % args.region)
+        lg.info("regions start & stop : %d %d" % (rstart, rstop))
+        #remove header & newlines
+        seq = "".join(rawseq.split('\n')[1:])
+
+        lg.info("loaded %d nucleotides of region %s" % (len(seq), args.region))
+        lg.info("loaded sequence start %s" % seq[:50])
+        lg.info("loaded sequence end %s" % seq[-50:])
+
+        basebase = os.path.basename(filebase)
+        lg.info("sequence basename %s" % basebase)
+
+        FALIGN = open(filebase + '.haplo.aln', 'w')
+        FALIGN.write("CLUSTAL W (1.82) multiple sequence alignment\n\n")
+        aligned = {}
+        arefkey = ""
+        with open(filebase + '.haplo.fasta', 'w') as F:
+
+            wseq = copy.copy(seq)
+            F.write(">%s.reference\n" % basebase)
+            aligned[basebase] = copy.copy(wseq)
+            arefkey = basebase
+            while wseq:
+                F.write("%s\n" % wseq[:80])
+                wseq = wseq[80:]
+
+            for h in haplotypes:
+                hseq = list(copy.copy(seq))
+                haplotype = haplotypes[h]
+                hloci = [(x[0], x[1]) for x in sorted(haplotype)]
+                prevlocus = loci[max(0, loci.index(hloci[0])-1)]
+                nextlocus = loci[min(len(loci), loci.index(hloci[-1])+1)]
+                start = prevlocus[1]+1
+                stop = nextlocus[1]-1
+                for allele in haplotype:
+                    if allele[2] == '?':
+                        hseq[allele[1] - rstart] = 'N'
+                    else:
+                        hseq[allele[1] - rstart] = allele[2]
+
+                #back to string & cut out the haplotype
+                hseq = "".join(hseq)[start-rstart:stop+1-rstart]
+
+                aligned['haplo_%03d' % h] = 'n' * (start - rstart) + \
+                                            copy.copy(hseq)
+
+                F.write(">%s.h%03d\n" % (basebase, h))
+                while hseq:
+                    F.write("%s\n" % hseq[:80])
+                    hseq = hseq[80:]
+
+        #write .aln alignment
+        alignKeys = sorted(aligned.keys())
+        keysize = max(map(len, alignKeys))+1
+        pos = 0
+        while max(map(len, aligned.values())) > 0:
+            reffrag = aligned[arefkey][:60]
+            if len(reffrag) < 60:
+                reffrag += "n" * (60 - len(reffrag))
+            reffraglist = list(reffrag)
+            pos += 60
+            dfrag = list([' '] * 60)
+            sfrag = list([' '] * 60)
+
+            for akey in alignKeys:
+                frag = aligned[akey][:60]
+                if len(frag) < 60:
+                    frag += "n" * (60 - len(frag))
+                fraglist = list(frag)
+                fraglist2 = list(frag)
+                if 'haplo_' in akey:
+                    for ii, ff in enumerate(fraglist):
+                        if fraglist[ii].lower() !=  'n':
+                            if fraglist[ii] != reffraglist[ii]:
+                                fraglist[ii] = fraglist[ii].upper()
+                                if fraglist[ii] != 'n':
+                                    dfrag[ii] = '.'
+                            else:
+                                fraglist[ii] = fraglist[ii].lower()
+                                if fraglist[ii] != 'n':
+                                    sfrag[ii] = '*'
+
+
+                            #fraglist2[ii] = '.'
+                    frag = "".join(fraglist)
+                else:
+                    pass #frag = frag.upper()
+
+                FALIGN.write(("%%-%ss %%s %%d\n" % keysize) % (
+                    akey, frag, pos+rstart))
+                aligned[akey] = aligned[akey][60:]
+
+            finalfrag = []
+            for ii, df in enumerate(dfrag):
+                if df == '.':
+                    finalfrag.append('.')
+                elif sfrag[ii] == '*':
+                    finalfrag.append('*')
+                else:
+                    finalfrag.append(' ')
+
+            FALIGN.write(("%%-%ss %%s\n\n" % keysize) % (
+                    "", "".join(finalfrag)))

@@ -1,0 +1,25 @@
+#!/usr/bin/env Rscript
+
+#library(ggplot2)
+
+args <- commandArgs(trailingOnly = TRUE)
+
+#ld density plot
+raw <- as.matrix(read.table(args[1]))
+dd <- as.dist((1-raw)/2)
+
+dim(dd)
+
+fit <- hclust(dd)
+groups <- cutree(fit, h=0.15)
+write.table(groups, file=paste(args[1], '.groups', sep=''), sep="\t",
+            quote=FALSE,)
+
+png(paste(args[1], '.tree.png', sep=''), width=2000, height=2000)
+plot(fit, cex=0.9)
+rect.hclust(fit, h=0.15, border="red") 
+dev.off()
+
+
+
+

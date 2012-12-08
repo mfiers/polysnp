@@ -1,0 +1,192 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import jinja2
+
+import argparse
+import logging
+import collections
+
+import numpy as np
+
+import vcf
+
+logging.basicConfig(level=logging.DEBUG)
+lg = logging.getLogger('polystat')
+
+MAXDEPTH = 10000
+
+parser = argparse.ArgumentParser(description='Gather stats on the polysnp vcf file!')
+
+parser.add_argument('-b', dest='base', default='stats', 
+                     help='output base for all reports')
+
+#parser.add_argument('-l', dest='seqlen', default=None, 
+#                     help='Sequence length assessed')
+
+parser.add_argument('vcf', type=str, default='-', nargs='?', 
+                    help='vcf file input (needs nucleotide frequencies '+
+                    'FORMAT:NF, - for stdin)')
+
+#parser.add_argument('-s', dest='simple', help='use full filenames for '
+#                    + 'the samples', action='store_false', default=True)
+
+parser.add_argument('-r', dest='Rplot', help='Try to generate plots'
+                    + ' (needs R!)', action='store_true', default=False)
+
+parser.add_argument('-l', dest='lengths', help='fasta lengths file')
+
+args = parser.parse_args()
+
+if not args.lengths:
+    lg.error("Need lengths file")
+    sys.exit()
+
+if not args.lengths:
+    lg.error("Need lengths file")
+    sys.exit()
+
+#read lengths
+seqinfo = {}
+lg.info("start parsing %s" % args.lengths)
+with open(args.lengths) as F:
+    for line in F:
+        line = line.strip()
+        if not line: continue
+        ls = line.split("\t")
+        assert(len(ls) >= 2)
+        seqinfo[ls[0]] = int(ls[1])
+lg.info("found %d sequences (total lenght %d)" % (
+    len(seqinfo), sum(seqinfo.values())))
+
+
+vcf = vcf.PSVCF(args.vcf)
+
+lg.debug("output base %s" % args.base)
+lg.debug("found samples %s" % ", ".join(vcf.sample_names))
+
+output_names = vcf.simple_names()
+lg.debug("using names: %s" % ", ".join(output_names))
+
+snps_per_seq = collections.defaultdict(int)
+
+def _generate_alleles_stat():
+    return { 0 : 0, 
+             1 : 0, 
+             2 : 0, 
+             3 : 0, 
+             4 : 0  }
+
+#number of alleles per locus
+alleles_per_locus = collections.defaultdict(_generate_alleles_stat)
+#number of alleles per sample
+alleles_per_sample = [_generate_alleles_stat() for x in output_names]
+#no of loci that are differetn from the reference
+different_per_sample = [0 for x in output_names]
+#no of loci that are differetn from the reference
+loci_with_coverage = [0 for x in output_names]
+#as above - but with at least one locus present
+presdiff_per_sample = [0 for x in output_names]
+
+#write allele freq & depth distribution table
+F = open(args.base + '.allele.freq.tsv', 'w')
+G = open(args.base + '.depth.tsv', 'w')
+H = open(args.base + '.nucleotide.freq.tsv', 'w')
+
+
+for i, locus in enumerate(vcf):
+    snps_per_seq[locus.seq] += 1
+    for i, sample in enumerate(locus.samples):
+        #allele frequency data
+        nf = sample.allele_freqs()
+        noalleles = len([x for x in nf if x > 0])
+        if noalleles > 0:
+            loci_with_coverage[i] += 1
+
+        alleles_per_locus[output_names[i]][noalleles] += 1
+        alleles_per_sample[i][noalleles] += 1
+
+        if locus.ref != str(sample):
+            different_per_sample[i] += 1
+            if noalleles > 0:
+                presdiff_per_sample[i] += 1
+        af = reversed(sorted(nf))
+        if i > 0:
+            F.write("\t")
+            G.write("\t")
+            H.write("\t")
+
+        F.write("\t".join(map(str, af)))
+        G.write(str(sample.dp))
+        H.write("\t".join(map(str, nf)))
+        
+    F.write("\n")
+    G.write("\n")
+    H.write("\n")
+
+F.close()
+G.close()
+H.close()
+
+kys = seqinfo.keys()
+kys.sort()
+
+total_loci_seen = sum(snps_per_seq.values())
+
+perc_with_coverage=[float(x)/total_loci_seen * 100 for x in loci_with_coverage]
+perc_presdiff=[float(x)/total_loci_seen * 100 for x in presdiff_per_sample]
+perc_diff=[float(x)/total_loci_seen * 100 for x in different_per_sample]
+
+seqs_with_snps = len(snps_per_seq.keys())
+
+with open(args.base + '.snps.per.seq.tsv', 'w') as F:
+    F.write("#seq_id\tseq_len\tno_snps\n")
+    for seqid in kys:
+        if snps_per_seq[seqid] > 0:
+            F.write("%s\t%d\t%d\n" % (seqid, seqinfo[seqid], snps_per_seq[seqid]))
+
+# #write the used names
+with open(args.base + '.names.tsv', 'w') as F:
+    F.write("\t".join(output_names))
+    F.write("\n")
+
+if args.Rplot:
+    os.system('polyplot %s' % args.base)
+
+#write basic report
+with open(os.path.join(os.path.dirname(__file__), 'report.jinja2')) as F:
+    jtemp = jinja2.Template(F.read())
+
+napls = 0
+perc_per_locus = collections.defaultdict(dict)
+sum_per_noall = [0,0,0,0,0]
+perc_per_noall = [0,0,0,0,0]
+
+for i, sample_name in enumerate(output_names):
+    assert(sum(alleles_per_locus[sample_name].values()) == total_loci_seen)
+    for noall in range(0,5):
+        thisnoall = alleles_per_locus[sample_name][noall]
+        sum_per_noall[noall] += thisnoall
+        napls += thisnoall
+        perc_per_locus[sample_name][noall] = 100. * thisnoall / total_loci_seen
+
+def _getp(v, sm):
+    if sm == 0: return 0
+    return 100. * v / sm
+
+#abs_per_noall =  [_getp(x, sum(sum_per_noall)) for x in sum_per_noall]
+perc_per_noall = [_getp(x, sum(sum_per_noall)) for x in sum_per_noall]
+
+print  sum_per_noall
+print perc_per_noall
+
+    # for noall in range(0,5):
+    #     tv = sum([alleles_per_locus[x][noall] for x in output_names])
+    #     F.write("| %-10d" % tv)
+    #     F.write(" %05.2f%%" % (100. * tv / napls))
+    # F.write("\n")
+
+with open(args.base + '.report', 'w') as F:
+    F.write(jtemp.render(locals()))
+

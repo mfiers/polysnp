@@ -1,0 +1,209 @@
+#!/usr/bin/env python
+
+import argparse
+import copy
+import logging
+import math
+import os
+import random
+import sys
+import tempfile
+
+parser = argparse.ArgumentParser(description="simulate multi layer alleles")
+
+parser.add_argument('frac', nargs='+', help='fraction of layer in the sample', 
+                    type=float)
+parser.add_argument('-n', '--no', type=int, help='number of loci to simulate', 
+                    default=10000)
+parser.add_argument('-b', '--base', help='plot basename')
+parser.add_argument('-v', '--verbose', action='store_true')
+parser.add_argument('-c', '--coverage', type=int, 
+                    help='average sequence coverage (normally distributed)', 
+                    default=30)
+parser.add_argument('-a', '--no_alleles', type=int, default=4,
+                    help='number of different alleles allowed (4 for SNPs)')
+parser.add_argument('-p', '--ploidy', type=int, default=2,
+                    help='ploidy level of each layer')
+parser.add_argument('-d', '--coveragesd', type=float, help='sd of the coverage', 
+                    default=10)
+parser.add_argument('-f', '--filter_boring', type=int, default=0, metavar='N',
+                    help='include every Nth boring locus (i.e. maf=1)')
+parser.add_argument('-m', '--mutrate', type=int, metavar='N',
+                    help='every Nth locus*allele has a mutation',
+                    default=100)
+parser.add_argument('-H', '--heterozygosity', type=int, metavar='N', 
+                    help='every Nth base is heterozygous',
+                    default=100)
+
+args = parser.parse_args()
+
+if args.verbose:
+    logging.basicConfig(level=logging.DEBUG)
+else:
+    logging.basicConfig(level=logging.INFO)
+lg = logging.getLogger(__name__)
+
+
+if args.base is None:
+    lg.critical("need to specifiy a base name for the output (-b)")
+    sys.exit(-1)
+
+LAYERFRACS = args.frac
+
+MUT = args.mutrate
+HET = args.heterozygosity
+
+
+lfmiss = 1.0 - sum(LAYERFRACS)
+if abs(lfmiss) < 0.0001: 
+    lfmiss = 0
+if lfmiss < 0:
+    lg.critical("sum of layer fractions > 1")
+    sys.exit(-1)
+if lfmiss > 0.0001:
+    LAYERFRACS.append(lfmiss)
+
+lg.info("running with layer fractions (%.2f) %s" % (sum(LAYERFRACS), LAYERFRACS))
+
+
+if args.no_alleles < 2:
+    lg.critical("cannot simulate with less that 2 alleles allowed")
+
+ALL = range(args.no_alleles)
+
+freqfile = "%s.freq.tsv" % args.base
+
+OUT = open(freqfile, 'w')
+lg.info('writing to %s' % freqfile)
+
+DEBUG = True
+
+iii = 0
+boring = 0
+while True:
+
+    bs = ''
+    bslog = []
+
+    base = [0] * args.ploidy
+    while random.randint(0, HET) == 0:
+        base[random.randint(0, len(base)-1)] =  \
+            random.choice(ALL)
+
+    base.sort()
+        
+    layers = []
+    allcount = [0] * args.no_alleles
+
+    while True:
+        locus_cov = int(random.gauss(args.coverage, args.coveragesd))
+        if locus_cov > 10:
+            break
+
+    if DEBUG:
+        bs = 'cv %3d' % locus_cov
+        bs += ' pa %s' % "".join(map(str, base))
+        bslog.append(bs)
+
+    for layercount, layer_fraction in enumerate(LAYERFRACS):
+        bs = ''
+        layercov = int(locus_cov * layer_fraction)
+
+        #for each of the layers
+        #randomly determine the layer genotype
+        layer_gtype = copy.copy(base)
+        while random.randint(0, MUT) == 0:
+            layer_gtype[random.randint(0, args.ploidy-1)] = \
+                random.choice(ALL)
+
+        if DEBUG:
+            bs += 'layer %2d lcov %3d gt ' % (
+                layercount, layercov)
+            for i in range(args.ploidy):
+                if layer_gtype[i] == base[i]: 
+                    bs += '.'
+                else: 
+                    bs += '%s' % layer_gtype[i]
+
+        remainingcov = layercov        
+        totcov = 0
+        bs += ' cov '
+        for i in range(args.ploidy-1):            
+            p = 1.0 / (args.ploidy-i)
+            #bs += ' (%3.2f) ' % p
+            s0 = int(random.gauss((remainingcov * p),
+                                  (remainingcov * p * (1-p))))
+            s0 = min(remainingcov, max(0, s0))
+            totcov += s0
+            bs += '%3d' % s0
+            allcount[layer_gtype[i]] += s0
+            remainingcov -= s0
+            #if remainingcov < 1: break
+        else:
+            allcount[layer_gtype[-1]] += remainingcov
+            bs += '%3d ' % remainingcov
+            totcov += remainingcov
+            
+        assert(totcov == layercov)
+        bs += ' allc %s' % " ".join(['%3d' % x for x in allcount])
+        bslog.append(bs)
+        
+            
+    bs = ''
+    alfs = [float(x) / sum(allcount) for x in allcount]
+    alfs.sort()
+    alfs.reverse()
+
+    if alfs[0] > 0.99 and args.filter_boring > 1:
+        if random.randint(0, args.filter_boring) != 0:
+            boring += 1
+            continue
+
+    if DEBUG and bslog:
+        for bs in bslog:
+            lg.debug(bs)
+
+    iii += 1
+    if iii > args.no:
+        break
+
+    if not DEBUG:
+        if iii % 1000 == 0:
+            sys.stderr.write('.')
+            sys.stderr.flush()
+
+    if DEBUG:
+        bs = " frac " + " ".join(["%5.2f" % x for x in alfs])
+        bs += " | %5.2f " % sum(alfs)
+        lg.debug(bs)
+
+    if sum(alfs) > 1.0001:
+        print bs
+        sys.exit()
+    if alfs[0] > 1.0001:
+        print bs
+        print sum(allcount)
+        sys.exit()
+
+
+    OUT.write("\t".join(map(str, alfs)) + "\n")
+
+lg.info("filtered %d boring loci" % boring)
+OUT.close()
+
+if args.base:
+    pbase = args.base
+else:
+    pbase = ''
+
+pbase += '__%s' % "_".join(["%03d" % int(math.floor(x*100)) for x in args.frac])
+Rscript = os.path.join(os.path.dirname(__file__), 'polysimR')
+cl = '%s %s %s' % (Rscript, freqfile, pbase)
+lg.info(cl)
+os.system(cl)
+
+
+
+
+
+

@@ -1,0 +1,305 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import argparse
+import time
+import logging as lg
+import subprocess as sp
+
+parser = argparse.ArgumentParser(description='Call SNPs!')
+parser.add_argument('-q', type=int, help="base quality cutoff - "+
+                    "ignore all nucleotides with a quality score " +
+                    "lower than this", dest='qual', default=13)
+
+parser.add_argument('-c', type=int, help="allele count cutoff - "+
+                    "ignore all alleles with counts below this number "+
+                    "(default 2)",
+                    dest='count', default=2)
+
+parser.add_argument('-F', type=float, help="allele fraction cutoff - "+
+                    "ignore all alleles with a allele fraction lower than this"+
+                    "(default 0.05)",
+                    dest='fraction', default=0.05)
+
+parser.add_argument('-C', type=int, help="downgrade MAPQ (see samtools mpileup -C) - "+
+                    "default 0 = off",
+                    dest='mapqc', default=0)
+
+parser.add_argument('-r', type=str, help="sequence to process",
+                    dest='region')
+parser.add_argument('-6',  help="Illumina1.3+ encoding", 
+                    dest='ill13', action='store_true', default=False)
+parser.add_argument('-f', dest='refseq', type=str, help="indexed reference "+
+                    " sequence")
+parser.add_argument('-v', dest='verbose', action='store_true',
+                    help='verbose output')
+
+
+parser.add_argument('-o', dest='out', help='vcf output file. "-" for stdout. Default -', default='-')
+parser.add_argument('bam', type=str, nargs='+', help='input bamfile')
+
+args = parser.parse_args()
+
+if args.verbose:
+    lg.basicConfig(level=lg.DEBUG)
+else:
+    lg.basicConfig(level=lg.INFO)
+
+
+nucleotides =  ['A', 'C', 'G', 'T']
+
+lg.info("Reference sequence %s" % args.refseq)
+for b in args.bam:
+    lg.info("Bam file %s" % b)
+
+samtoolscl = 'samtools mpileup -B -E -d 5000000000 -I -q %d -Q %d' % (
+    args.qual, args.qual)
+
+if args.mapqc:
+    samtoolscl += ' -C %d' % args.mapqc
+if args.region:
+    samtoolscl += ' -r %s' % args.region
+if args.ill13:
+    samtoolscl += ' -6'
+samtoolscl += ' -f %s' % args.refseq
+samtoolscl += ' %s' % " ".join(args.bam)
+
+lg.info("executing:")
+lg.info(samtoolscl)
+process = sp.Popen(samtoolscl.split(), stdout=sp.PIPE)
+QA = []
+
+reFindInDels = re.compile('([\-\+])([0-9]+)')
+reFindStartRead = re.compile('\^.')
+
+if args.out == '-':
+    F = sys.stdout
+else:
+    F = open(args.out, 'w')
+    
+
+F.write("##fileformat=VCFv4.0\n")
+F.write("##fileDate=%s\n" % time.strftime("%Y%m%d"))
+F.write("##cwd=%s\n" % os.getcwd())
+F.write("##commandline=%s\n" % " ".join(sys.argv))
+F.write('##INFO=<ID=NS,Number=1,Type=Integer,Description="Number of Samples With Data">\n')
+F.write('##INFO=<ID=DP,Number=1,Type=Integer,Description="Total Depth">\n')
+F.write('##INFO=<ID=AN,Number=1,Type=Integer,Description="Total number of alleles in called genotypes">\n')
+F.write('##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Read Depth">\n')
+F.write('##FORMAT=<ID=NF,Number=1,Type=String,Description="Nucleotide Frequencies A|C|G|T">\n')
+F.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t%s\n" % "\t".join(args.bam))
+
+
+poscount = 0
+fndcount = 0
+
+for line in process.stdout:    
+    ls = line.split()
+    sequence_id = ls[0]
+    pos = int(ls[1])
+    refbase = ls[2].upper()
+    samples = []
+    alleles = []
+    allelefreqs = []
+
+    poscount += 1
+    if poscount % 100000 == 0:
+        if fndcount > 0:
+            lg.info("Processed %d positions, %d potential SNPs found, 1 SNP every %.2f nucleotides." % (
+                    poscount, fndcount, (float(poscount) / fndcount)))
+        else:
+            lg.info("Processed %d positions, %d potential SNPs found" % (
+                    poscount, fndcount))
+
+    lg.debug('position %s %d ref: %s' % (sequence_id, pos, refbase))
+        
+    #go through the pileups for each of the bam files
+    for i in range(0, len(ls[3:]), 3):
+        _ss = ls[i+3:i+6]
+        pileseq = _ss[1]
+        pilequal = _ss[2]
+        lg.debug("raw pileup : %s" % pileseq)
+        lg.debug("raw qual   : %s" % pilequal)
+        o_pileseq = pileseq
+        o_pilequal = pilequal
+
+        #remove start of read indicators
+        pileseq = reFindStartRead.sub('', pileseq)
+
+        # remove end of read indicators
+        pileseq = pileseq.replace('$', '')
+
+        # uncertain about this - bases indicated as deleted in the
+        # refseq are still here?? I do not understand this bit :(
+        # I am ignoring the '*' and will cut these out later
+        if pileseq != '*':
+            pileseq = pileseq.replace('*', '#')
+
+        #remove indel notation
+        remove = []
+        show = False        
+        for indel in reFindInDels.finditer(pileseq):
+            idsize = int(indel.groups()[1])
+            _s, _e = indel.start(), indel.end()
+            remove.append((_s, _e + idsize))
+        remove.sort()
+        remove.reverse()
+
+        for r in remove:
+            pileseq = pileseq[:r[0]] + pileseq[r[1]:]
+
+        # Do not want to see 'N' mismatches on either the forward or
+        # reverse strand. Marking these to be removed 
+        pileseq = pileseq.replace('N', '#')
+        pileseq = pileseq.replace('n', '#')
+
+        #convert , & . to the reference base
+        pileseq = pileseq.replace(',', refbase)
+        pileseq = pileseq.replace('.', refbase)
+
+        #all to upper case
+        pileseq = pileseq.upper()
+
+        #process quality
+        if o_pileseq == '*':
+            pileseq = ''
+            pilequal = ''
+
+        seqlist = list(pileseq)
+
+        # get the phred corrected quality this
+        
+        quallist = [x-33 for x in map(ord, list(pilequal))]
+        
+        def qmark(n):
+            rv = []
+            for nn in n:
+                if nn < args.qual:
+                    rv.append('#')
+                else:
+                    rv.append(str(nn)[0])
+            return "".join(rv)
+
+        lg.debug("Prefil seq : %s" % "".join(["%3s" % x for x in seqlist]))
+        lg.debug("Prefil qua : %s" % "".join(["%3d" % x for x in quallist]))
+
+        lg.debug("Prefil seq : %s" % "".join(seqlist))
+        lg.debug("Prefil qua : %s" % "".join(qmark(quallist)))
+        
+        # zip bases & quality together and filter on args.qual and it not being '#'
+        zipped = [x for x in zip(seqlist, quallist) if (x[1] >= args.qual and x[0] != '#')]
+
+        #and unzip again
+        if zipped:
+            seqlist, quallist = zip(*zipped)
+        else:
+            seqlist, quallist = [], []
+
+
+        assert(len(seqlist) == len(quallist))
+
+        _alleles_to_remove = []
+        if len(seqlist) > 0:
+            #find & remove rather  rare alleles - based on nucleotide counts & fractions
+            _raw_allele_counts = [seqlist.count(x) for x in nucleotides]
+
+            for i, _alf in enumerate(_raw_allele_counts):
+                if _alf > 0 and _alf < args.count:
+                    #mark th is allele for removal
+                    _alleles_to_remove.append(nucleotides[i])
+
+            _raw_allele_freqs = [
+                float(seqlist.count(x)) / len(seqlist) 
+                for x in nucleotides]
+
+            for i, _alf in enumerate(_raw_allele_freqs):
+                if _alf > 0 and _alf < args.fraction:
+                    #mark this allele for removal
+                    #print 'removing based on fraction', seqlist, nucleotides[i]
+                    _alleles_to_remove.append(nucleotides[i])
+
+
+        lg.debug("Prefil seq : %s" % "".join(["%3s" % x for x in seqlist]))
+        lg.debug("Prefil qua : %s" % "".join(["%3d" % x for x in quallist]))
+
+        lg.debug("Filter seq : %s" % "".join(seqlist))
+        lg.debug("Filter qua : %s" % "".join(qmark(quallist)))
+        
+
+        new_pileseq = "".join(seqlist)
+        for _atr in _alleles_to_remove:
+            new_pileseq = new_pileseq.replace(_atr, '')
+
+        samples.append(new_pileseq)
+
+        #get allele frequencies
+        _new_allele_counts = [new_pileseq.count(x) for x in nucleotides]        
+        allelefreqs.append(_new_allele_counts)
+
+        #get a list of all observed alleles
+        _allele_list = list(set(new_pileseq))
+        _allele_list.sort()        
+        alleles.append("".join(_allele_list))
+                       
+    showThis = False
+    for a in alleles:
+        if len(a) > 1:
+            showThis = True
+            break
+        elif len(a) == 1 and a[0] != refbase:
+            #print a, refbase
+            showThis = True
+            break
+
+    
+    if not showThis:
+        #not interesting!
+        continue
+
+    fndcount += 1
+    #calculate some stats
+    _alt2 = set()
+    [_alt2.update(set(x)) for x in alleles if x]
+
+    try:
+        _alt2.remove(refbase)
+    except KeyError:
+        pass #wasn't there to start with
+    #print refbase, _alt2
+    if 'N' in _alt2:
+        print alleles
+        print line.split('\t')[4]
+    _alt_alleles = _alt2
+    _all_alleles = [x for x in alleles if x]
+    _no_alleles_seen = len(set(list(",".join(_all_alleles))))
+    _total_coverage = sum([len(x) for x in samples])
+    
+    info = []
+    info.append("NS=%d" % len(_all_alleles))
+    info.append("DP=%d" % _total_coverage)
+    info.append("AN=%d" % _no_alleles_seen)
+
+    format_spec = "DP:NF"
+    formats = ['%s' % len(x) for x in samples]
+    for i,a in enumerate(samples):
+        nf = []
+        for n in ['A', 'C', 'G', 'T']:
+            nf.append(a.count(n))
+        formats[i] += ':%s' % "|".join(map(str, nf))
+        
+    vcfline = "\t".join([sequence_id, str(pos), '.', refbase,
+                         ",".join(list(set(_alt_alleles))),
+                         '20', 'PASS', ";".join(info),
+                         format_spec] + formats
+                        
+
+                        )
+    F.write(vcfline + "\n")
+    
+    #print '###', sequence_id, pos, refbase
+    #print vcfline
+    #for i, a in enumerate(samples):
+    #    print "%20s %4s %10s %s" % (args.bam[i][-20:], alleles[i], allelefreqs[i], a)
+    

@@ -1,0 +1,316 @@
+#!/usr/bin/env python
+"""
+First step of the polysnp haplotype builder - build a big graph of all
+allele links
+
+SNP         1      2      3      4
+
+ALLELLES    A------C--+   C      C
+            T      G  +---G------T
+
+"""
+
+import os
+import sys
+import argparse
+import collections
+import logging as lg
+import pysam
+
+import vcf
+
+COLORS = [
+    "deeppink4",
+    "chartreuse4",
+    "lightblue4",
+    "orangered1",
+    "yellow",
+    ]
+
+lg.basicConfig(level=lg.DEBUG)
+
+parser = argparse.ArgumentParser(description='Build haplotype graph!')
+
+parser.add_argument('-r', type=str, help="region to process",
+                    dest='region')
+
+parser.add_argument('-b', dest='base', help='base output name for the graph')
+
+#parser.add_argument('-S', dest='same', action='store_true', default=False,
+#                    help='assume that mate & read have the same name')
+
+parser.add_argument('--profile', dest='profile', action='store_true', default=False,
+                    help='run the profiler')
+
+parser.add_argument('-v', dest='verbose', action='store_true', default=False,
+                    help='verbose output')
+
+parser.add_argument('-Q', type=int, help="base quality cutoff - "+
+                    "ignore all nucleotides with a quality score " +
+                    "lower than this", dest='qual', default=13)
+
+parser.add_argument('vcf', help='VCF file with the loci to process')
+parser.add_argument('bam', nargs='*', help='BAM files used to generate the vcf file')
+
+args = parser.parse_args()
+if args.verbose:
+    lg.getLogger().setLevel(lg.DEBUG)
+    
+nucleotides =  ['A', 'C', 'G', 'T']
+
+class Allele(object):
+    def __init__(self, seq, pos, nucl, read):
+        self.seq = seq
+        self.pos = pos
+        self.nucl = nucl
+        self.read = read
+
+    __hash__ = None
+    
+    def __str__(self):
+        return "%s:%s:%s" % (self.seq, self.pos, self.nucl)
+    
+def main():
+#    if not args.same:
+#        lg.critical('read pairs must have the same read name - otherwise is '+
+#                    'not implemented')
+#        sys.exit(-1)
+    
+    #open the vcf file
+    vcffile = vcf.PSVCF(args.vcf, region=args.region)
+
+    #open the graph
+    TREE = open(args.base + '.tree', 'w')
+    TREE.write("""
+    digraph G {
+    
+    """)
+    
+    #find the BAM files
+    bam_files = []
+    if args.bam:
+        bam_files = args.bam
+    else:
+        lg.warning("No BAM files defined - see if we can find them in the VCF")
+        #find the raw bam file locations
+        for i in vcffile.sample_names:
+            if not os.path.exists(i):
+                lg.warning("Cannot find %s" % i)
+                lg.warning("Cannot use BAM file paths from VCF")
+                bam_files = []
+                break
+            else:
+                lg.warning("Found %s" % i)
+                bam_files.append(i)
+        #see if there are bam files enxt to the input vcf
+        if not bam_files:
+            vcf_base = os.path.dirname(args.vcf)
+            lg.info("see if we can find the bam files in %s" % vcf_base)
+            for i in vcffile.sample_names:
+                nbf = os.path.join(vcf_base, os.path.basename(i))
+                if not os.path.exists(nbf):
+                    lg.error("Cannot find bam files - problem!")
+                    sys.exit(-1)
+                lg.info("Found %s" % nbf)
+                bam_files.append(nbf)
+
+
+    assert(len(bam_files) == len(vcffile.sample_names))
+    bams = []
+    lg.info("Found %d samples" % len(bam_files))
+    lg.info("Opening bam files")
+    for b in bam_files:
+        lg.info("Using pysam to open %s" % b)
+        bams.append(pysam.Samfile(b, 'rb'))
+
+    #get the pileup iterators
+    pups = []
+    for b in bams:
+        pups.append(b.pileup(region=args.region))
+
+    #determine region coordinates
+    region_seq = None
+    regions_start = 0
+    region_end = int(1e12)
+    if args.region:
+        _as = args.region.split(':')
+        region_seq = _as[0]
+        if len(_as) > 1:
+            _as2 = _as[1].split('-')
+            region_start = int(_as2[0])
+            region_end = int(_as2[0])
+
+    next_pup = []
+    for p in pups:
+        try:
+            val = p.next()
+        except StopIteration:
+            val = None
+        next_pup.append(val)
+
+    
+    #allLoci = AllLoci()
+
+    #histories - store all reads & mates that hit a certain allele
+    read_history = collections.defaultdict(list)
+    mate_history = collections.defaultdict(list)
+
+    lg.info("start processing snps from the vcf file")
+    
+    for v in vcffile:
+
+        lg.debug("%%%%%%%%%%%%%%%%%%%")
+
+        lg.debug("%%%% SNP %s" % v)
+
+        #make sure that we read the pileup until the next objects in next_pup correspond with
+        #the snp we're interested in
+        for i, p in enumerate(next_pup):
+            while next_pup[i] and (next_pup[i].pos+1 < v.pos):
+                try:
+                    next_pup[i] = pups[i].next()
+                except StopIteration:
+                    next_pup[i] = None
+                except ValueError:
+                    next_pup[i] = None
+                    
+        #Parse each of the BAM files
+        for i, p in enumerate(next_pup):
+
+            if not p:
+                lg.info("%s (%s) is empty" % (p, bam_files[i]))
+                continue
+            
+            lg.debug("### BAM FILE %s" % bam_files[i])
+            #and for each BAM file, all reads
+            reads_seen = []
+            
+            for pileread in p.pileups:
+
+                #get the read
+                read = pileread.alignment
+
+                #check if we want to use this read
+                if read.is_unmapped: continue
+                if read.is_secondary: continue
+                #if read.read2: continue                
+                if not read.is_proper_pair: continue
+
+                #get the mate!
+                mate = bams[i].mate(read)
+                #and the current nucleotide & quality
+                nucl = read.seq[pileread.qpos]
+                qual = read.qual[pileread.qpos]
+
+                #we do not want to see low quality bases!!!
+                if qual < args.qual: continue
+                if read.mapq < args.qual: continue
+
+                #allele id 
+                read_id = (read.qname, read.pos+1)
+                mate_id = (mate.qname, read.pnext+1)
+                #print 'TSS', read.qname
+                FF = 'HWI-EAS19X_10119_FC61TWV:6:118:7000:13963#0'
+                if read.qname == FF:
+                    print "TSS", nucl, pileread.qpos, v, read_id, mate_id
+
+                #lg.debug("READ MATE %s %s %s" % (read.pnext, read_id, mate_id))
+                #lg.debug("READ MATE %s %s" % (read.pos, str(mate)[:80]))
+                #lg.debug("READ MATE %s %s" % (read.pnext, str(read)[:80]))
+
+                assert(read_id != mate_id)
+                #mate_identifier = (read.pos+1, mate.qname)
+                #lg.debug("processing read %s" % str(read_id))
+                if read_id in reads_seen:
+                    lg.critical(" &&&&& already seen this read %s - that is weird :(" % str(read_id))
+                    lg.critical(str(read))
+                    import pprint
+                    lg.critical(pprint.pformat(read.flag))
+                    sys.exit(-1)
+                reads_seen.append(read_id)
+                
+                #quality check
+                qval = ord(qual) - 33
+                if qval < args.qual:
+                    #lg.debug("ignoring %s %s %s" % (nucl, qual, qval))
+                    continue
+                
+                allele = Allele(v.seq, v.pos, nucl, read)
+
+                #find allele links already seen on this read - see if this allele links
+                #of the allele/reads observed so far
+
+                if read_history[read_id]:
+                    #lg.debug("for read identifier %s and allele %s" % (read_id, allele))
+                    #lg.debug('  found read links')
+                    for linked_allele in read_history[read_id]:
+                        #lg.debug('   - %s' % linked_allele)
+                        TREE.write('  %s_%s_%s -> %s_%s_%s [color="%s"]\n' % (
+                            linked_allele.seq, linked_allele.pos, linked_allele.nucl,
+                            allele.seq, allele.pos, allele.nucl, COLORS[i]
+                            ))
+                if mate_history[read_id]:
+                    for mated_allele in mate_history[read_id]:
+                        lg.debug('   MM MATE %s' % linked_allele)
+                        TREE.write('  %s_%s_%s -> %s_%s_%s [style="dotted", color="%s"]\n' % (
+                            mated_allele.seq, mated_allele.pos, mated_allele.nucl,
+                            allele.seq, allele.pos, allele.nucl, COLORS[i]
+                            ))
+                        #TREE.write("\t".join(map(list(read_id) + [allele] + j)))
+                #add the allele print allele, pileread.qpos, read.qname, mate.qname
+                #lg.debug('adding %s %s %s' % (read.mapq, read_id, allele))
+                #lg.debug('%s %s' % (read_id, mate_id))
+                #lg.debug('-' * 80)
+                read_history[read_id].append(allele)
+                mate_history[mate_id].append(allele)
+                #print mate_history
+                
+                
+                #print read.qname, read.qpos
+                #print mate.qname, mate.qpos
+                #print '-' * 80
+                #alleles.append(read.alignment.seq[read.qpos])
+                #print 'query', read.alignment
+                #print 'proper pair?', read.alignment.is_proper_pair
+                #print 'mate', 
+                #print dir(read.alignment)
+
+            #print vcffile.sample_names[i], v.pos, p.n, "".join(alleles)
+        #sys.exit()
+    TREE.write("\n}\n")
+    TREE.close()
+
+if __name__ == "__main__":
+    if args.profile:
+        import cProfile
+        pfn  ='polyhaplo.profile.%d' % os.getpid()
+        cProfile.run("main()", pfn)
+        lg.info('Wrote profile to %s' % pfn)
+        import pstats
+        p = pstats.Stats(pfn)
+        p.strip_dirs().sort_stats('time').print_stats(18)
+        os.unlink(pfn)
+    else:
+        main()
+    
+#while True:
+    
+    
+    
+#read the first vcf location!
+#     print v.vcf_line
+#     print("processing %s:%s" % (v.seq, v.pos))
+#     for b in bams:
+#         for col in b.pileup(v.seq, v.pos-1, v.pos, stepper='samtools'):
+#             if col.pos != v.pos-1:
+#                 continue
+#             print '(%s) coverage at base %s = %s' % (b.filename, col.pos , col.n)
+            
+#             for read in col.pileups:
+#                 print '\tbase in read %s = %s' % (
+#                     read.alignment.qname,
+#                     read.alignment.seq[read.qpos])
+#         print b, v.pos, v.pos+1
+
+#     break
+# o

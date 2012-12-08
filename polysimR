@@ -1,0 +1,59 @@
+#!/usr/bin/env Rscript
+
+library(ggplot2)
+library(hexbin)
+args <- commandArgs(trailingOnly = TRUE)
+
+input = args[1]
+base = args[2]
+
+input
+base
+
+d <- read.table(input)
+colnames(d)
+
+
+## jpeg(paste( 'af_hex_12', base, '.jpg', sep=''), quality=100)
+## p <- ggplot(d, aes(V1, V2)) + stat_binhex(bins=c(60,60)) +
+##   xlim(0,1) + ylim(0, 0.5)
+## p
+## dev.off()
+
+## jpeg(paste( 'af_hex_23', base, '.jpg', sep=''), quality=100)
+## p <- ggplot(d, aes(V2, V3)) + stat_binhex(bins=c(60,60)) +
+##   xlim(0,1) + ylim(0, 0.5)
+## p
+## dev.off()
+
+
+jpeg(paste( 'af_dot_12', base, '.jpg', sep=''), quality=100)
+p <- ggplot(d, aes(V1, V2)) + geom_point(alpha=0.2) +
+  xlim(0,1) + ylim(0, 0.5) + labs(title = base)
+p
+dev.off()
+
+jpeg(paste( 'af_dot_23', base, '.jpg', sep=''), quality=100)
+p <- ggplot(d, aes(V2, V3)) + geom_point(alpha=0.2) +
+  xlim(0,1) + ylim(0, 0.5) + labs(title = base)
+p
+dev.off()
+
+jpeg(paste( 'af_de_', base, '.jpg',  sep=''), quality=100)
+p <- ggplot(d) +
+  geom_density(aes(x=d$V1), fill="black", alpha = 0.8, labels=c('1')) +
+  geom_density(aes(x=d$V2), fill="green", alpha = 0.6) +
+  geom_density(aes(x=d$V3), fill="blue", alpha = 0.4) +
+  labs(title = base) + coord_cartesian(xlim=c(0,1), ylim=c(0,10))
+p
+dev.off()
+
+
+jpeg(paste( 'af_hi_', base, '.jpg', sep=''), quality=100)
+p <- ggplot(d) +
+  geom_histogram(aes(x=d$V1), fill="black", alpha = 0.8, labels=c('1')) +
+  geom_histogram(aes(x=d$V2), fill="green", alpha = 0.6) +
+  geom_histogram(aes(x=d$V3), fill="blue", alpha = 0.4) +
+  labs(title = base) + coord_cartesian(xlim=c(0,1), ylim=c(0,2000))
+p
+dev.off()

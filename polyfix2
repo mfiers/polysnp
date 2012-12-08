@@ -1,0 +1,539 @@
+#!/usr/bin/env python
+
+import os
+import re
+import sys
+import math
+import argparse
+import itertools
+import collections
+import logging as lg
+import subprocess as sp
+
+import numpy as np
+
+import rpy2
+import rpy2.robjects as robjects
+import rpy2.robjects.numpy2ri
+from rpy2.robjects.packages import importr
+rpy2.robjects.numpy2ri.activate()
+
+#Rstats = importr('stats')
+pvclust = importr('pvclust')
+
+import networkx as nx
+
+import pysam
+
+import vcf
+
+LDLIST = []
+
+lg.basicConfig(level=lg.INFO)
+parser = argparse.ArgumentParser(description='Remove bad calls based on correlation ' +
+                                 'with a neighbouring SNPs')
+
+parser.add_argument('vcf', type=str, default='-', nargs='?', 
+                    help='vcf file input (determines locations to check, '+
+                    '- for stdin)')
+
+parser.add_argument('-v',  help="Verbose output", dest='verbose', 
+                    action='store_true', default=False)
+
+parser.add_argument('bam', nargs='+', help='samtools indexed bamfiles to check')
+parser.add_argument('-b', dest='base', help='basename for output', default='polyfix')
+parser.add_argument('-m', dest='min_allele_count', help='minimal allele count - discard otherwise',
+                    type=int, default=2)
+parser.add_argument('-M', dest='mask', help='mask read name - remove this from the read names '+
+                    'to get a better output')
+parser.add_argument('-S', dest='stepper', help='stepper to use for pileups ("all" or "samtools")', 
+                    default='samtools')
+parser.add_argument('-r', type=str, help="region to process",
+                    dest='region')
+
+
+class peekorator(object):
+    
+    def __init__(self, iterator):
+        self.empty = False
+        self.peek = None
+        self._iterator = iterator
+        try:
+            self.peek = iterator.next()
+        except StopIteration:
+            self.empty = True
+
+    def __iter__(self):
+        return self
+
+    def next(self):        
+        """
+        Return the self.peek element, or raise StopIteration 
+        if empty
+        """
+        if self.empty:
+            raise StopIteration()
+        to_return = self.peek
+        try:
+            self.peek = self._iterator.next()
+        except StopIteration:
+            self.peek = None
+            self.empty = True
+        return to_return
+
+
+def PileupGenerator(vcf, bamfiles, region=None):
+    """
+    Return a set of stacked colums from the pileup - one for each sample.        
+    """
+
+    plg = lg.getLogger('PiG')
+    plg.setLevel(lg.DEBUG)
+    pileups = []
+    plg.debug("opening pileupgenerator with region %s" % region)
+    for i, bamfile in enumerate(bamfiles):
+        if region:
+            pup = peekorator(bamfile.pileup(region=region, stepper=args.stepper))
+            pileups.append(pup)
+            plg.debug("opened pileupgenerator with region %s (%s)" % (region, str(pup)))
+        else:
+            pup(peekorator(bamfile.pileup(stepper=args.stepper)))
+            pileups.append(pup)
+            plg.info("opened global pileup generator (%s)" % (str(pup)))
+        
+    current_ptid = 0
+    
+    for record in vcf:
+        rv = [record]
+        #lg.debug("pileup finding record %s" % record)
+        for i, pileup in enumerate(pileups):
+            sid = nice_sample_names[i]
+
+            #see if we're in range for this pileup?
+            if pileup.empty:
+                #nothing in here - 
+                rv.append(None)
+                continue
+
+            #peek at next record
+            peek = pileup.peek
+            try:
+                peekseq = bamfiles[i].getrname(peek.tid)
+            except:
+                lg.critical("cannot getrname from %s" % peek)
+                raise
+
+            assert(peekseq == record.seq) #no seq switching (yet)
+
+            if peek.pos >= record.pos:
+                #lg.info('next %d %d' % (peek.pos, record.pos))
+                #next pileup position is past the current record position:
+                rv.append(None)                
+                continue
+
+            #ok - we're good - parse through the seqs until we have somehting
+            for p in pileup:
+                pseq = bamfiles[i].getrname(p.tid)
+                
+                #do not have the code for seq switching
+                assert(pseq == record.seq)                
+                    
+                if pseq == record.seq and \
+                        p.pos+1 == record.pos:
+                    rv.append(p)
+                    break            
+                if pileup.empty:
+                    rv.append(None)
+                    break
+                peek = pileup.peek
+                peekseq = bamfiles[i].getrname(peek.tid)
+                if peekseq == record.seq and peek.pos+1 > record.pos:
+                    #next position is passed our record
+                    rv.append(None)
+                    break
+            else:
+                #it appears we ran out of the pileup - 
+                rv.append(None)
+            #nextcol = pileup.next()
+            #print nextcol
+        #lg.debug('yielding %d %s' % (record.pos, str(rv[-1])[:20]))
+        #if record.pos == 1880:
+        #    for j, r in enumerate(rv[1:]):
+        #        print nice_sample_names[j], r
+        yield(rv)                          
+    
+def nid(c,p,n):
+    """
+    return node id
+    """
+    return '%s.%s.%s' % (c,p,n)
+
+def eid(a,b):
+    """
+    edge id
+    """
+    return ('%s.%s.%s' % a,
+            '%s.%s.%s' % b)
+
+def simple_report(message, g):
+    lg.info(message + ": %d nodes" %  len(g.nodes()))
+    loci = set([n[:2] for n in g.nodes()])
+    lg.info(message + ": %d loci" % len(loci))
+
+
+def createGraph(alg, rta, sampleid=None):
+    """
+    Create graph (alg) edges based on the reads_to_alleles (rta) structure 
+    """
+    
+    no_edges = 0
+    max_weight = 0
+    loci = collections.defaultdict(set)
+    linked_loci = set()
+
+    for read in rta:
+        for all1 in rta[read]:
+            loc1 = (all1[0], all1[1])
+            loci[loc1].add(all1)
+
+            #if not alg.has_node(all1): continue
+            for all2 in rta[read]:
+                loc2 = (all2[0], all2[1])
+                loci[loc2].add(all2)
+
+                if all1 >= all2: continue
+
+                lnk = tuple(sorted([loc1, loc2]))
+                linked_loci.add(lnk)
+
+                if not alg.has_edge(all1, all2):
+                    no_edges += 1
+                    alg.add_edge(all1, all2, weight=0)
+
+                alg[all1][all2]['weight'] += 1
+                if alg[all1][all2]['weight'] > max_weight:
+                    max_weight = alg[all1][all2]['weight']
+    lg.info("Edges added: %d" % no_edges)
+    lg.info("Max weight: %d" % max_weight)
+    lg.info("unique loci %d" % len(loci))
+
+    return alg
+
+def getLoci(alg):
+    """
+    return a list of loci
+    """
+    loci = collections.defaultdict(set)
+    for node in alg.nodes():
+        loci[node[:2]].add(node)
+    return loci
+
+def filterGraphAlleleAbundance(alg):
+    """
+    Filter nodes based on nucleotide frequency - remove all low abundant nodes
+    """
+
+    loci = getLoci(alg)
+
+    if len(loci) == 0: 
+        return None
+
+    #allele frequency filter
+    if True:
+        laar = 0
+        for l in loci:
+            allcount = sorted([(alg.node[x]['count'], x[2]) for x in loci[l]])
+            major_allele = allcount[-1][1]
+            
+            if False:
+                #remove all major alleles from the graph 
+                alg.remove_node((l[0], l[1], major_allele))
+
+        low_abundant_alleles = [x[1] for x in allcount if x[0] < args.min_allele_count]
+        #lg.info("removing %d low abundandant alleles" % len(low_abundant_alleles))
+        for laa in low_abundant_alleles:
+            laar += 1
+            if alg.has_node((l[0], l[1], laa)):
+                alg.remove_node((l[0], l[1], laa))
+
+        lg.info("removed %d low abundant alleles" % laar)
+    #remove single allele loci
+    simple_report("post_abundance_filter", alg)
+    return alg    
+
+def filterGraphSingleAlleleLoci(alg):
+    """
+    Remove all nodes with just one allele
+    """
+
+    loci = getLoci(alg)
+    single_allele_loci = 0
+    for l in  loci:
+        if len(loci[l]) == 1:
+            single_allele_loci += 1
+            sa_locus = list(loci[l])[0]
+            alg.remove_node(sa_locus)
+    lg.info("removed %d single-allele loci" % single_allele_loci)
+
+    simple_report("post homozygosity_filter", alg)
+    return alg
+
+def filterRemoveZeroConnectAlleles(alg):
+    """
+    Remove all alleles with no connections
+    """
+    # #remove zero connectivity nodes
+    to_delete = []
+    for n in alg.nodes():
+        if alg.degree(n) == 0:
+            to_delete.append(n)
+    lg.info("removing %d zero degree nodes" % len(to_delete))
+    [alg.remove_node(x) for x in to_delete]
+    
+    #print nx.degree_hi(alg)
+    simple_report("post zero_degree_node filter", alg)
+
+    return alg
+
+def phi_correlation_check(n1, n2, tbl):
+    #see if there are connections between all1 & all2 
+    # - if not ignore
+    
+    a,b,c,d = 0,0,0,0
+
+    for k,v in loclin.items():
+        if k[0] == n1:
+            if k[1] == n2: a += v
+            else: c += v
+        else:
+            if k[1] == n2: b += v
+            else: d += v
+
+    #fix d
+    a,d = max(a, d), max(a, d)
+    
+    if a == 0: return False
+
+    try:
+        phi = ( (a * d) - (b * c) ) / \
+            math.sqrt ( (a+b) * (c+d) * (a+c) * (b+d))
+    except ZeroDivisionError:
+        print loclin, a,b,c,d
+        raise
+
+    return (a > 2 and phi > 0.8)
+
+def LD_check(n1, n2, tbl):
+    """
+    Check for LD
+    """
+
+    #see if there are connections between all1 & all2 
+    # - if not ignore
+
+    # matrix
+    #     n1   n1'
+    #
+    # n2   a   b
+    # n2'  c   d
+    #
+    a,b,c,d = 0,0,0,0
+    
+    n = 0.
+    for k,v in loclin.items():
+        n += v
+        if k[0] == n1:
+            if k[1] == n2: a += v
+            else: c += v
+        else:
+            if k[1] == n2: b += v
+            else: d += v
+
+    pa, pb, pc, pd = a/n, b/n, c/n, d/n
+    x11 = tbl.get((n1, n2), 0)
+    p11 = x11 / n
+    D = p11 - ((pa + pb) * (pa + pc))
+
+    LDLIST.append(D)
+
+    if False:
+        if abs(D) > 0.75: 
+            mark = '@@'
+        else:
+            mark = '  '
+        print "%s  %s %s %5.2f --- %.2f %.2f %.2f %.2f (%.2f) --- %.2f %.2f | %.2f --- %.2f" % ( mark, n1, n2, p11, pa, pb, pc, pd, pa+pb+pc+pd, pa+pb, pa+pc, 
+                                                                                                 (pa+pb) * (pa+pc), D)
+    
+    return D
+
+
+if __name__ == '__main__':
+
+    args = parser.parse_args()
+    if args.verbose:
+        lg.getLogger().setLevel(lg.DEBUG)
+
+    vcf = vcf.PSVCF(args.vcf, region=args.region)
+    
+    nice_sample_names = vcf.simple_names()
+    lg.info("vcf sample names: %s" % ", ".join(nice_sample_names))
+
+    bamfiles = []
+    lg.debug('opening bam files')
+    for i, bamfile in enumerate(args.bam):
+        if not nice_sample_names[i] in bamfile:
+            lg.warning("are you sure the order of bamfiles corresponds to the " +
+                       "order in the VCF file?")
+        lg.debug('opening bam %s' % bamfile)
+        bamfiles.append(pysam.Samfile(bamfile, 'rb'))
+
+
+    
+    reads_to_alleles = [collections.defaultdict(list) for x in nice_sample_names]
+    
+    #print reads_to_alleles
+    #allele connection graphs:
+    algs = [nx.Graph() for x in nice_sample_names]
+
+    #go through the reads. identify alleles, store what alleles are
+    #linked by what reads
+    loci_assessed = 0
+    alleles_assessed = 0
+    alleles_stored = 0
+    read_alleles_processed = 0
+
+    for data in PileupGenerator(vcf, bamfiles, args.region):
+        record = data[0]
+        pileups = data[1:]
+        loci_assessed += 1
+
+        assert(len(pileups) == len(bamfiles))
+        for i, pileup in enumerate(pileups):
+            
+            sample = record.samples[i]
+            alleles_assessed += 1
+
+            sample_alleles = sample.alleles()
+
+            if len(sample_alleles) < 2:
+                #this locus/sample does not need to be processed
+                continue
+
+            for a in sample.alleles():
+                #lg.debug("adding %s / %s / %s to graph" % (a, nice_sample_names[i], record))
+                algs[i].add_node((record.seq, record.pos, a), count=0)
+
+            if pileup == None: continue
+            alleles_stored += 1
+
+
+            # print nice_sample_names[i],  sample
+            for read in pileup.pileups:
+                nt = read.alignment.seq[read.qpos-1]
+                # print read.alignment.qname, nt, read.alignment.is_read1
+                read_alleles_processed += 1
+                try:
+                    algs[i].node[(record.seq, record.pos, nt)]['count'] += 1
+                except KeyError:
+                    #was not in the set - or so it appears - add it now
+                    algs[i].add_node((record.seq, record.pos, nt), count=0)
+
+                reads_to_alleles[i][read.alignment.qname].append(
+                    (record.seq, record.pos, nt))
+                
+    lg.info("No loci assessed: %d" % loci_assessed)
+    lg.info("No loci*samples assessed: %d" % alleles_assessed)
+    lg.info("No loci*samples stored in graph: %d" % alleles_stored)
+    lg.info("No loci*samples*reads processed: %s" % read_alleles_processed)
+
+    #convert the reads-to-alleles structure to a graph linking alleles
+    lg.info("samples were %s" % nice_sample_names)
+
+    for i,g in enumerate(algs):
+
+        LDLIST = []
+
+        lg.info("Preparing graph for %s" % nice_sample_names[i])
+        rta = reads_to_alleles[i]
+        #print i, len(reads_to_alleles[i])
+        G = createGraph(g, rta)
+
+        #alg = filterGraph(alg)
+        #alg = filterGraph(alg)
+
+        loci = getLoci(G)
+
+        # now do the phi calculate per locus - with as aim to remove
+        # all links which are not strong
+        to_remove = set()
+        for l in  loci:
+            #print "LOCUS", l, len(loci[l])
+
+            #find all neighbouring loci
+            nloci = set()
+            for allele in loci[l]:
+                for neighbour in G.neighbors(allele):
+                    #only look of neighb. loci to the right of the current locus
+                    if neighbour <= allele: continue
+                    #remember this as a neighbour
+                    nloci.add(neighbour[:2])
+
+
+            # Now - for each pair
+            for nl in nloci:
+                #print " - NLOCUS", nl                
+
+                # create a correlation table 
+                loclin = collections.defaultdict(int)
+                # for all alleles for the current locus (l) 
+                # and the neighbouring locus (nl)
+                for all1 in loci[l]:
+                    for all2 in loci[nl]:
+                        w = G[all1].get(all2, {}).get('weight', 0)
+                        #if w > 0:
+                        #    print all1, all2, w
+                        loclin[(all1[2], all2[2])] += G[all1].get(all2, {}).get('weight', 0)
+                
+                #now check if we want to keep this link
+                for all1 in loci[l]:
+                    for all2 in loci[nl]:
+                        if loclin.has_key((all1[2], all2[2])):
+                            ld = LD_check(all1[2], all2[2], loclin)
+                            if G[all1].has_key(all2):
+                                G[all1][all2]['LD'] = ld
+                            else:
+                                if ld > 0.15:
+                                    print "WOW - LD - but not linked"
+                                    print all1, all2
+                        else:
+                            print 'woerd'
+                                
+
+
+        lg.info("Planning to remove %d edges (post phi)" % len(to_remove))
+        actually_removed = 0
+        for a,b in to_remove:
+            try:
+                #G.remove_edge(all1, all2)
+                #print '@', a, b, G.has_edge(a,b)
+                if G.has_edge(a,b):
+                    G.remove_edge(a,b)
+                    actually_removed += 1
+            except:
+                print 'FAIL #####',a,b
+                
+        lg.info("Actually removed %d edges (post phi)" % actually_removed)
+        simple_report('post phi', G)
+        
+        #G = filterRemoveZeroConnectAlleles(G)
+        #G = filterGraphSingleAlleleLoci(G)
+        #G = filterGraphAlleleAbundance(G)
+        #G = filterRemoveZeroConnectAlleles(G)
+        #G = filterGraphSingleAlleleLoci(G)
+        
+        nx.write_dot(G, nice_sample_names[i] + '.dot')
+
+        with open(nice_sample_names[i] + '.ld.csv', 'w') as F:
+            F.write("\n".join(map(str, LDLIST)))
+        
+        #plot LD graph
